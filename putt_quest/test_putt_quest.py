@@ -3,6 +3,7 @@
 Run from the repo root:  python -m pytest putt_quest/test_putt_quest.py
 """
 
+import json
 import time
 import urllib.request
 
@@ -54,6 +55,23 @@ def test_uphill_shortens_rollout():
     assert up.rollout_m < flat.rollout_m
 
 
+def test_render3d_camera_frames_ball_and_cup():
+    """Full background render + projection sanity, no window needed."""
+    from putt_quest.render3d import GreenScene
+
+    scene = GreenScene((640, 360), 4.0, 1.5, -1.0)   # 4 m breaking hole
+    scene.position_camera((0.0, 0.0))
+    assert scene.bg is not None and scene.bg.get_size() == (640, 360)
+
+    ball = scene.cam.project(scene.surface_pt(0.0, 0.0, 0.02))
+    cup = scene.cam.project(scene.surface_pt(0.0, 4.0, 0.02))
+    assert ball and cup
+    for p in (ball, cup):
+        assert 0 <= p[0] <= 640 and 0 <= p[1] <= 360
+    assert ball[1] > cup[1]          # ball renders below the cup
+    assert cup[2] > ball[2]          # cup is farther from the camera
+
+
 def test_listener_accepts_get_and_json_post():
     lis = ShotListener(port=8897)
     assert lis.start(), lis.error
@@ -69,5 +87,46 @@ def test_listener_accepts_get_and_json_post():
         s1, s2 = ShotListener.get_shot(), ShotListener.get_shot()
         assert (s1["speed_mph"], s1["hla_deg"]) == (4.5, -1.2)
         assert (s2["speed_mph"], s2["hla_deg"]) == (6.1, 2.0)
+    finally:
+        lis.stop()
+
+
+def test_listener_accepts_real_tracker_payload():
+    """ball_tracking.py posts a NESTED payload to /putting and reads back
+    res.json()['result'] — both must work end to end."""
+    lis = ShotListener(port=8898)
+    assert lis.start(), lis.error
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8898/putting",
+            data=b'{"ballData":{"BallSpeed":"4.20","TotalSpin":0,'
+                 b'"LaunchDirection":"-1.30"}}',
+            headers={"Content-Type": "application/json"})
+        body = urllib.request.urlopen(req).read()
+        assert json.loads(body)["result"] == "success"
+        time.sleep(0.1)
+        s = ShotListener.get_shot()
+        assert s is not None, "nested ballData payload was dropped"
+        assert (s["speed_mph"], s["hla_deg"]) == (4.2, -1.3)
+    finally:
+        lis.stop()
+
+
+def test_listener_status_pings_do_not_become_shots():
+    lis = ShotListener(port=8899)
+    assert lis.start(), lis.error
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8899/status",
+            data=b'{"trackerStatus":{"ballDetected":true,"ballRadius":14,'
+                 b'"fps":58.2}}',
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req).read()
+        time.sleep(0.1)
+        assert ShotListener.get_shot() is None
+        age, st = ShotListener.get_tracker_status()
+        assert age is not None and age < 5
+        assert st["balldetected"] is True
+        assert st["ballradius"] == 14
     finally:
         lis.stop()

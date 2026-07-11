@@ -5,3 +5,4 @@
 dist/
 readme-priv.md
 .vscode
+__pycache__/

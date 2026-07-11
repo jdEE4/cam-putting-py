@@ -15,6 +15,7 @@ from configparser import ConfigParser
 import ast
 import os
 import shutil
+import threading
 
 parser = ConfigParser()
 CFG_FILE = 'config.ini'
@@ -118,6 +119,10 @@ if parser.has_option('putting', 'width'):
     width=int(parser.get('putting', 'width'))
 else:
     width=640
+if parser.has_option('putting', 'statusping'):
+    statusping=int(parser.get('putting', 'statusping'))
+else:
+    statusping=1
 if parser.has_option('putting', 'customhsv'):
     customhsv=ast.literal_eval(parser.get('putting', 'customhsv'))
     print(customhsv)
@@ -709,6 +714,28 @@ def yuv2rgb(yuv):
 # allow the camera or video file to warm up
 time.sleep(0.5)
 
+# ---- ball setup status pings (consumed by Putt Quest on :8888) ----------
+# A background thread posts the latest detection state twice a second so
+# the game can show "ball ready / place ball" live. Fire-and-forget: if
+# nothing listens (or a GSPro connector runs instead) the post just fails
+# silently and putting is unaffected. Disable with statusping=0 in config.ini.
+TRACKER_STATUS = {"ballDetected": False, "locking": False,
+                  "ballX": 0, "ballY": 0, "ballRadius": 0, "fps": 0.0}
+
+def _status_ping_loop():
+    while True:
+        try:
+            requests.post('http://127.0.0.1:8888/status',
+                          json={"trackerStatus": dict(TRACKER_STATUS)},
+                          timeout=0.3)
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(0.5)
+
+if statusping == 1:
+    threading.Thread(target=_status_ping_loop, daemon=True,
+                     name="status-ping").start()
+
 previousFrame = cv2.Mat
 
 while True:
@@ -869,6 +896,7 @@ while True:
 
     cnts = imutils.grab_contours(cnts)
     center = None
+    ballCandidate = None      # ball seen in start zone but not locked yet
     
     # Startpoint Zone
 
@@ -937,6 +965,7 @@ while True:
                     # check if the circle is stable to detect if a new start is there
                     if not started or startPos[0]+10 <= center[0] or startPos[0]-10 >= center[0]:
                         if (center[0] >= sx1 and center[0] <= sx2):
+                            ballCandidate = (center, radius)
                             startCandidates.append(center)
                             if len(startCandidates) > startminimum :
                                 startCandidates.pop(0)
@@ -1175,10 +1204,16 @@ while True:
     else:
         cv2.line(frame,(sx2,int(y1+((y2-y1)/2))),(sx2+400,int(y1+((y2-y1)/2))),(255, 255, 255),4,cv2.LINE_AA) 
 
-        # Mark Start Circle
+        # Mark Start Circle (green while armed and waiting for the putt,
+        # red once the ball is moving)
     if started:
-        cv2.circle(frame, (startCircle[0],startCircle[1]), startCircle[2],(0, 0, 255), 2)
-        cv2.circle(frame, (startCircle[0],startCircle[1]), 5, (0, 0, 255), -1) 
+        startcol = (0, 200, 0) if not entered else (0, 0, 255)
+        cv2.circle(frame, (startCircle[0],startCircle[1]), startCircle[2], startcol, 2)
+        cv2.circle(frame, (startCircle[0],startCircle[1]), 5, startcol, -1)
+
+    # Mark a ball that is seen in the start zone but not locked yet
+    if not started and ballCandidate:
+        cv2.circle(frame, ballCandidate[0], max(int(ballCandidate[1]), 5), (0, 200, 255), 2)
 
     # Mark Entered Circle
     if entered:
@@ -1212,6 +1247,30 @@ while True:
         cv2.putText(frame,"Fixed FPS: %.2f" % overwriteFPS,(400,20),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0, 0, 255))
     else:
         cv2.putText(frame,"Detected FPS: %.2f" % video_fps[0],(400,20),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0, 0, 255))
+
+    # ---- ball setup status banner (bottom center) + status ping update ----
+    if started and not entered:
+        setupMsg, setupCol = "BALL READY - PUTT AWAY", (0, 200, 0)
+    elif started and not left:
+        setupMsg, setupCol = "TRACKING PUTT...", (0, 200, 255)
+    elif started:
+        setupMsg, setupCol = "SHOT DETECTED", (255, 200, 0)
+    elif ballCandidate:
+        setupMsg, setupCol = "HOLD STILL - LOCKING BALL...", (0, 200, 255)
+    else:
+        setupMsg, setupCol = "PLACE BALL IN START ZONE (yellow box)", (0, 0, 230)
+    setupSize = cv2.getTextSize(setupMsg, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
+    setupY = frame.shape[0] - 10
+    cv2.rectangle(frame, (int(320-setupSize[0]/2)-8, setupY-setupSize[1]-8),
+                  (int(320+setupSize[0]/2)+8, setupY+6), (30, 30, 30), -1)
+    cv2.rectangle(frame, (int(320-setupSize[0]/2)-8, setupY-setupSize[1]-8),
+                  (int(320+setupSize[0]/2)+8, setupY+6), setupCol, 2)
+    cv2.putText(frame, setupMsg, (int(320-setupSize[0]/2), setupY),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, setupCol, 2)
+    TRACKER_STATUS.update(ballDetected=bool(started and not entered),
+                          locking=bool(ballCandidate and not started),
+                          ballX=int(startCircle[0]), ballY=int(startCircle[1]),
+                          ballRadius=int(startCircle[2]), fps=round(fps, 1))
     
     #if args.get("video", False):
     #    out1.write(frame)
