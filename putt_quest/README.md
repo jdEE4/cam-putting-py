@@ -17,11 +17,13 @@ webcam ──> ball_tracking.py ──HTTP :8888──> putt_quest (this game)
 ```
 
 The tracker in this fork also pings its live detection state
-(ball locked? still searching?) to the same port twice a second, so the
-game can tell you when your physical ball is placed correctly *before*
-you putt. If nothing is listening the pings fail silently, so the
-tracker still works stand-alone or with a GSPro connector
-(set `statusping = 0` in `config.ini` to turn the pings off entirely).
+(ball locked? still searching?) to the same port twice a second, and
+streams a small webcam thumbnail (~10 fps) for the in-game camera
+preview, so the game can tell you when your physical ball is recognized
+*before* you putt. If nothing is listening these fail silently, so the
+tracker still works stand-alone or with a GSPro connector. Turn them off
+in `config.ini` with `statusping = 0` (status) and `previewstream = 0`
+(webcam thumbnail) if you want the tracker completely quiet.
 
 ## Quick start
 
@@ -43,19 +45,27 @@ adjust speed, `LEFT/RIGHT` adjust HLA, `SPACE` putts. Test mode also
 draws a ghost preview of where the current speed/HLA would roll —
 handy for learning how break works.
 
-## Is my ball set up correctly?
+## Is my ball recognized? (this matters most)
 
-Both windows tell you, live:
+A putt only counts if the tracker has *locked* your ball first, so both
+windows make that state impossible to miss:
 
-- **Tracker window** (`ball_tracking.py`): a banner at the bottom walks
-  you through setup — red *PLACE BALL IN START ZONE*, yellow
-  *HOLD STILL — LOCKING BALL...* while it stabilizes, green
-  *BALL READY — PUTT AWAY* once locked. The detected ball is circled
-  yellow while locking and green when armed.
-- **Game HUD**: the bottom status bar mirrors the same state ("tracker
-  online — place ball in start zone" / "BALL READY — putt when ready"),
-  plus warns when the tracker isn't running at all or when port 8888 is
-  taken by a GSPro connector.
+- **Tracker window** (`ball_tracking.py`): the whole frame gets a thick
+  colored border — red while searching, cyan with a progress bar while
+  *locking* (the ball has to hold still for ~10 frames), green once
+  *BALL READY*. A bottom banner spells out the same, and the detected
+  ball is ringed (yellow locking → green armed).
+- **Game — big ready badge**: while waiting for a putt, a large pill
+  above the status bar shows a red **NO BALL DETECTED**, an amber
+  **LOCKING 60%** with a fill bar, or a green pulsing **BALL READY**.
+  Don't putt until it's green.
+- **Game — debug camera panel** (`D`): a live thumbnail of your webcam
+  feed (streamed from the tracker) with the same colored border and
+  label, so you can confirm ball recognition without leaving the game
+  window. Shows "camera feed lost" if the stream goes stale.
+
+The lock meter means a wobbling or still-rolling ball never reads as
+ready, so you can't accidentally fire a putt at a ball that isn't set.
 
 ## Controls
 
@@ -67,7 +77,9 @@ Both windows tell you, live:
 | SPACE | (test mode) putt |
 | W / S | (test mode) speed +/- |
 | LEFT / RIGHT | (test mode) HLA +/- |
-| D | toggle debug overlay |
+| `[` / `]` | lower / raise render resolution |
+| G | toggle the auto-resolution guard |
+| D | toggle debug overlay (camera preview + stats) |
 | M | toggle minimap |
 | R | restart round |
 | Q / ESC | quit |
@@ -103,11 +115,30 @@ per camera move (i.e. once per putt) into a background surface; each
 frame only redraws the ball, trail, aim line, flag, and HUD. Measured
 cost: ~30 ms per putt for the background, <1 ms per frame after that.
 
-Everything is drawn on an internal 640x360 canvas integer-scaled to the
-window; raise `INTERNAL_W/H` in `putt_quest/graphics.py` for sharper
-output on faster machines. The slope of each green is visually
-exaggerated (`Z_EXAG` in `render3d.py`) so a 2% break is actually
-visible from behind the ball.
+### Resolution & keeping your machine happy
+
+The 3D scene renders onto an internal canvas that is smooth-scaled to the
+window. Four presets — **Low 640×360, Medium 960×540, High 1280×720,
+Ultra 1600×900** — trade sharpness for CPU. Change it live with `[` and
+`]`; a small readout in the bottom-right shows the current resolution and
+live FPS so you can watch the load.
+
+Because there's no dedicated GPU, higher presets cost more CPU. Two
+safeguards keep that from crashing or stuttering a laptop:
+
+- **Auto-resolution guard** (on by default, toggle with `G`): if the
+  frame rate stays below ~48 fps for a few seconds it automatically drops
+  one preset. So even if you pick Ultra and it's too much, it self-heals
+  down to something smooth within seconds.
+- The expensive part (the terrain/sky/cup background) is rendered once
+  per putt and cached, not every frame — so raising the resolution mostly
+  affects that one-time cost, not the steady-state frame rate.
+
+Your chosen preset, guard setting, and minimap toggle persist in
+`putt_quest_settings.json`. Start Low and step up with `]` while watching
+the FPS readout; if it dips, either let the guard handle it or step back
+down. The slope of each green is visually exaggerated (`Z_EXAG` in
+`render3d.py`) so a 2% break is actually visible from behind the ball.
 
 ## Roadmap ideas
 

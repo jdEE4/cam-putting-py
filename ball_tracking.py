@@ -16,6 +16,7 @@ import ast
 import os
 import shutil
 import threading
+import base64
 
 parser = ConfigParser()
 CFG_FILE = 'config.ini'
@@ -123,6 +124,10 @@ if parser.has_option('putting', 'statusping'):
     statusping=int(parser.get('putting', 'statusping'))
 else:
     statusping=1
+if parser.has_option('putting', 'previewstream'):
+    previewstream=int(parser.get('putting', 'previewstream'))
+else:
+    previewstream=1
 if parser.has_option('putting', 'customhsv'):
     customhsv=ast.literal_eval(parser.get('putting', 'customhsv'))
     print(customhsv)
@@ -715,12 +720,28 @@ def yuv2rgb(yuv):
 time.sleep(0.5)
 
 # ---- ball setup status pings (consumed by Putt Quest on :8888) ----------
-# A background thread posts the latest detection state twice a second so
-# the game can show "ball ready / place ball" live. Fire-and-forget: if
-# nothing listens (or a GSPro connector runs instead) the post just fails
-# silently and putting is unaffected. Disable with statusping=0 in config.ini.
-TRACKER_STATUS = {"ballDetected": False, "locking": False,
-                  "ballX": 0, "ballY": 0, "ballRadius": 0, "fps": 0.0}
+# Background threads post the latest detection state (twice a second) and
+# an optional webcam thumbnail (~10 fps) so the game can show a live
+# "ball ready / place ball" indicator and an in-game camera preview.
+# Fire-and-forget: if nothing listens (or a GSPro connector runs instead)
+# the posts fail silently and putting is unaffected. Disable with
+# statusping=0 / previewstream=0 in config.ini.
+TRACKER_STATUS = {"ballDetected": False, "locking": False, "lock": 0.0,
+                  "state": "idle", "ballX": 0, "ballY": 0,
+                  "ballRadius": 0, "fps": 0.0}
+
+# ball-lock stability meter: the ball must hold still for LOCK_FRAMES
+# consecutive frames before it is considered "locked / ready".
+LOCK_FRAMES = 10
+LOCK_TOL = 6            # px of jitter tolerated while locking
+lockRef = None
+lockCount = 0
+lockProgress = 0.0
+
+# shared latest preview frame, written by the main loop, posted by a thread
+_preview_lock = threading.Lock()
+PREVIEW_LATEST = {"jpg_b64": None, "meta": {}, "seq": 0}
+_lastPreviewTime = 0.0
 
 def _status_ping_loop():
     while True:
@@ -732,9 +753,28 @@ def _status_ping_loop():
             pass
         time.sleep(0.5)
 
+def _preview_ping_loop():
+    last_seq = -1
+    while True:
+        with _preview_lock:
+            seq = PREVIEW_LATEST["seq"]
+            jpg = PREVIEW_LATEST["jpg_b64"]
+            meta = dict(PREVIEW_LATEST["meta"])
+        if jpg is not None and seq != last_seq:
+            last_seq = seq
+            try:
+                requests.post('http://127.0.0.1:8888/preview',
+                              json={"frame": jpg, **meta}, timeout=0.3)
+            except requests.exceptions.RequestException:
+                pass
+        time.sleep(0.08)
+
 if statusping == 1:
     threading.Thread(target=_status_ping_loop, daemon=True,
                      name="status-ping").start()
+if previewstream == 1:
+    threading.Thread(target=_preview_ping_loop, daemon=True,
+                     name="preview-ping").start()
 
 previousFrame = cv2.Mat
 
@@ -1248,30 +1288,85 @@ while True:
     else:
         cv2.putText(frame,"Detected FPS: %.2f" % video_fps[0],(400,20),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0, 0, 255))
 
-    # ---- ball setup status banner (bottom center) + status ping update ----
+    # ---- ball-lock stability meter ---------------------------------------
+    # The ball must sit still (within LOCK_TOL px) for LOCK_FRAMES frames
+    # before we call it "ready", so a moving/wobbling ball never reads as
+    # ready and can't be putted at prematurely.
     if started and not entered:
-        setupMsg, setupCol = "BALL READY - PUTT AWAY", (0, 200, 0)
-    elif started and not left:
-        setupMsg, setupCol = "TRACKING PUTT...", (0, 200, 255)
-    elif started:
-        setupMsg, setupCol = "SHOT DETECTED", (255, 200, 0)
-    elif ballCandidate:
-        setupMsg, setupCol = "HOLD STILL - LOCKING BALL...", (0, 200, 255)
+        lockProgress = 1.0
+    elif ballCandidate is not None:
+        c = ballCandidate[0]
+        if lockRef is None or (abs(c[0]-lockRef[0]) + abs(c[1]-lockRef[1])) > LOCK_TOL:
+            lockRef = c
+            lockCount = 1
+        else:
+            lockCount += 1
+        lockProgress = min(1.0, lockCount / float(LOCK_FRAMES))
     else:
-        setupMsg, setupCol = "PLACE BALL IN START ZONE (yellow box)", (0, 0, 230)
-    setupSize = cv2.getTextSize(setupMsg, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
-    setupY = frame.shape[0] - 10
-    cv2.rectangle(frame, (int(320-setupSize[0]/2)-8, setupY-setupSize[1]-8),
-                  (int(320+setupSize[0]/2)+8, setupY+6), (30, 30, 30), -1)
-    cv2.rectangle(frame, (int(320-setupSize[0]/2)-8, setupY-setupSize[1]-8),
-                  (int(320+setupSize[0]/2)+8, setupY+6), setupCol, 2)
-    cv2.putText(frame, setupMsg, (int(320-setupSize[0]/2), setupY),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, setupCol, 2)
-    TRACKER_STATUS.update(ballDetected=bool(started and not entered),
-                          locking=bool(ballCandidate and not started),
+        lockCount = max(0, lockCount - 2)
+        lockRef = None if lockCount == 0 else lockRef
+        lockProgress = min(1.0, lockCount / float(LOCK_FRAMES))
+
+    ballReady = bool(started and not entered)
+
+    # ---- ball setup status banner + full-frame border --------------------
+    if ballReady:
+        setupMsg, setupCol, trackerState = "BALL READY - PUTT AWAY", (0, 200, 0), "ready"
+    elif started and not left:
+        setupMsg, setupCol, trackerState = "TRACKING PUTT...", (255, 200, 0), "rolling"
+    elif started:
+        setupMsg, setupCol, trackerState = "SHOT DETECTED", (255, 200, 0), "shot"
+    elif ballCandidate:
+        setupMsg, setupCol, trackerState = "HOLD STILL - LOCKING BALL...", (0, 200, 255), "locking"
+    else:
+        setupMsg, setupCol, trackerState = "PLACE BALL IN START ZONE (yellow box)", (0, 0, 230), "searching"
+
+    fh_, fw_ = frame.shape[:2]
+    # thick colored border framing the whole view = unmissable state cue
+    cv2.rectangle(frame, (2, 2), (fw_-3, fh_-3), setupCol, 4)
+    # lock progress bar (while locking) just above the banner
+    if trackerState == "locking":
+        barw = int(fw_*0.5)
+        barx = int(fw_/2 - barw/2)
+        bary = fh_ - 42
+        cv2.rectangle(frame, (barx, bary), (barx+barw, bary+10), (40, 40, 40), -1)
+        cv2.rectangle(frame, (barx, bary), (barx+int(barw*lockProgress), bary+10), setupCol, -1)
+        cv2.rectangle(frame, (barx, bary), (barx+barw, bary+10), (255, 255, 255), 1)
+    setupSize = cv2.getTextSize(setupMsg, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+    setupY = fh_ - 12
+    cv2.rectangle(frame, (int(fw_/2-setupSize[0]/2)-8, setupY-setupSize[1]-8),
+                  (int(fw_/2+setupSize[0]/2)+8, setupY+6), (25, 25, 25), -1)
+    cv2.rectangle(frame, (int(fw_/2-setupSize[0]/2)-8, setupY-setupSize[1]-8),
+                  (int(fw_/2+setupSize[0]/2)+8, setupY+6), setupCol, 2)
+    cv2.putText(frame, setupMsg, (int(fw_/2-setupSize[0]/2), setupY),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, setupCol, 2)
+
+    TRACKER_STATUS.update(ballDetected=ballReady,
+                          locking=bool(trackerState == "locking"),
+                          lock=round(lockProgress, 3), state=trackerState,
                           ballX=int(startCircle[0]), ballY=int(startCircle[1]),
                           ballRadius=int(startCircle[2]), fps=round(fps, 1))
-    
+
+    # ---- stream a webcam thumbnail to the game (~10 fps) -----------------
+    if previewstream == 1 and (frameTime - _lastPreviewTime) > 0.09:
+        _lastPreviewTime = frameTime
+        try:
+            thumb = resizeWithAspectRatio(frame, width=240)
+            ok_enc, buf = cv2.imencode('.jpg', thumb,
+                                       [int(cv2.IMWRITE_JPEG_QUALITY), 55])
+            if ok_enc:
+                th_, tw_ = thumb.shape[:2]
+                with _preview_lock:
+                    PREVIEW_LATEST["jpg_b64"] = base64.b64encode(buf).decode('ascii')
+                    PREVIEW_LATEST["meta"] = {"w": tw_, "h": th_,
+                                              "ready": ballReady,
+                                              "lock": round(lockProgress, 3),
+                                              "state": trackerState,
+                                              "fps": round(fps, 1)}
+                    PREVIEW_LATEST["seq"] += 1
+        except Exception as e:
+            print("preview encode error:", e)
+
     #if args.get("video", False):
     #    out1.write(frame)
 

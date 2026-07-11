@@ -112,6 +112,32 @@ def test_listener_accepts_real_tracker_payload():
         lis.stop()
 
 
+def test_listener_preview_frames_are_decoded_not_shots():
+    import base64
+    lis = ShotListener(port=8896)
+    assert lis.start(), lis.error
+    try:
+        # a tiny valid JPEG (1x1) is enough to exercise the pipeline
+        jpg = base64.b64decode(
+            "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB"
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wgALCAAB"
+            "AAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAB//aAAgBAQAAPwA//9k=")
+        payload = json.dumps({"frame": base64.b64encode(jpg).decode(),
+                              "ready": True, "lock": 1.0,
+                              "state": "ready", "w": 1, "h": 1}).encode()
+        req = urllib.request.Request(
+            "http://127.0.0.1:8896/preview", data=payload,
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req).read()
+        time.sleep(0.1)
+        assert ShotListener.get_shot() is None
+        age, blob, meta, seq = ShotListener.get_preview()
+        assert age is not None and blob == jpg and seq >= 1
+        assert meta["ready"] is True and meta["state"] == "ready"
+    finally:
+        lis.stop()
+
+
 def test_listener_status_pings_do_not_become_shots():
     lis = ShotListener(port=8899)
     assert lis.start(), lis.error

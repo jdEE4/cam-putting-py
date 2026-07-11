@@ -28,6 +28,7 @@ res.json()['result'] on the reply.
 
 from __future__ import annotations
 
+import base64
 import json
 import queue
 import threading
@@ -46,6 +47,9 @@ _LOCK = threading.Lock()
 _TRACKER_STATUS: dict = {}
 _TRACKER_STATUS_TIME: float = 0.0
 _EVENTS: "deque[Tuple[float, str]]" = deque(maxlen=8)
+
+# latest webcam preview: (timestamp, jpeg_bytes, meta_dict, sequence)
+_PREVIEW: dict = {"time": 0.0, "jpg": None, "meta": {}, "seq": 0}
 
 
 def _log_event(msg: str) -> None:
@@ -98,8 +102,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle(self, params: dict) -> None:
         global _TRACKER_STATUS_TIME
-        path = urlparse(self.path).path
-        if path.rstrip("/").endswith("status"):
+        path = urlparse(self.path).path.rstrip("/")
+        if path.endswith("preview"):
+            self._store_preview(params)
+            return
+        if path.endswith("status"):
             with _LOCK:
                 _TRACKER_STATUS.update(params)
                 _TRACKER_STATUS_TIME = time.time()
@@ -112,6 +119,22 @@ class _Handler(BaseHTTPRequestHandler):
         elif params:
             _log_event("rejected (no speed key): "
                        + json.dumps(params, default=str)[:80])
+
+    def _store_preview(self, params: dict) -> None:
+        """A /preview post carries a base64 JPEG in 'frame' plus small
+        metadata (ready flag, lock fraction, tracker state)."""
+        frame_b64 = params.pop("frame", None)
+        if not frame_b64:
+            return
+        try:
+            jpg = base64.b64decode(frame_b64)
+        except (ValueError, TypeError):
+            return
+        with _LOCK:
+            _PREVIEW["time"] = time.time()
+            _PREVIEW["jpg"] = jpg
+            _PREVIEW["meta"] = dict(params)
+            _PREVIEW["seq"] += 1
 
     def do_GET(self) -> None:          # noqa: N802
         self._handle(self._params_from_query())
@@ -185,3 +208,16 @@ class ShotListener:
     def get_events() -> List[Tuple[float, str]]:
         with _LOCK:
             return list(_EVENTS)
+
+    @staticmethod
+    def get_preview() -> Tuple[Optional[float], Optional[bytes], dict, int]:
+        """Returns (age_secs or None, jpeg_bytes or None, meta, sequence).
+
+        `sequence` bumps on each new frame so callers can avoid re-decoding
+        an unchanged image.
+        """
+        with _LOCK:
+            if not _PREVIEW["time"]:
+                return None, None, {}, 0
+            return (time.time() - _PREVIEW["time"], _PREVIEW["jpg"],
+                    dict(_PREVIEW["meta"]), _PREVIEW["seq"])
