@@ -1,5 +1,20 @@
 # Webcam based putting simulation for GSPRO utilizing the R10 and MLM2Pro connector:
 
+## Quick start for putt_quest (macOS/Linux)
+
+Run this from the repository root:
+
+```bash
+./run_putt_quest.sh
+```
+
+The script will:
+- create `.venv` if needed
+- install `requirements-game.txt` if missing
+- launch `putt_quest`
+
+No global `python` or `py` command is required.
+
 Calculation includes BallSpeed in MPH and HLA of the putt. Initial insperation on the solution comes from natter where I forked the initial OpenCV code.
 
 These connectors integrate the putting app to use in GSPRO
