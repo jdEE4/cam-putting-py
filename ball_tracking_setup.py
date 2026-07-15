@@ -6,6 +6,7 @@ import cv2
 import imutils
 import time
 import sys
+import platform
 import cvzone
 from ColorModuleExtended import ColorFinder
 import math
@@ -138,7 +139,7 @@ colorcount = 0
 calibrationtime = time.time()
 calObjectCount = 0
 calColorObjectCount = []
-calibrationTimeFrame = 30
+calibrationTimeFrame = 60
 
 # Calibrate Recording Indicator
 
@@ -319,7 +320,10 @@ if not args.get("video", False):
     if mjpegenabled == 0:
         vs = cv2.VideoCapture(webcamindex)
     else:
-        vs = cv2.VideoCapture(webcamindex + cv2.CAP_DSHOW)
+        if platform.system() == "Windows":
+            vs = cv2.VideoCapture(webcamindex, cv2.CAP_DSHOW)
+        else:
+            vs = cv2.VideoCapture(webcamindex)
         # Check if FPS is overwritten in config
         if overwriteFPS != 0:
             vs.set(cv2.CAP_PROP_FPS, overwriteFPS)

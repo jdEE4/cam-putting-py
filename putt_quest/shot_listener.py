@@ -1,25 +1,41 @@
 """HTTP shot listener for Putt Quest.
 
 The upstream tracker (ball_tracking.py) reports each detected putt to
-http://localhost:8888/ — normally consumed by a GSPro connector. Putt
-Quest binds that same port so the tracker needs ZERO modification.
+http://localhost:8888/putting — normally consumed by a GSPro connector.
+Putt Quest binds that same port so the tracker needs ZERO modification.
 
-We accept shots liberally so different tracker versions all work:
+The real tracker posts a NESTED payload:
+    {"ballData": {"BallSpeed": "4.20", "TotalSpin": 0,
+                  "LaunchDirection": "-1.30"}}
+so incoming JSON is flattened recursively before key matching. We also
+accept shots liberally so different tracker versions all work:
   * GET  with query params:  /?ballspeed=4.2&hla=-1.3&...
   * POST with a JSON body:   {"ballspeed": 4.2, "hla": -1.3}
   * POST with form fields
 Key names are matched case-insensitively; speed keys tried in order:
 ballspeed, ball_speed, speed, mph. HLA keys: hla, launchdirection, angle.
 
-Shots land in a thread-safe queue that the game loop drains.
+Extras for debugging / setup UI:
+  * POST /status with {"trackerStatus": {...}} updates a "tracker status"
+    snapshot (ball detected? radius? fps?) the game can show live.
+  * Every request (accepted or rejected) lands in a small event log the
+    game's debug overlay can render.
+
+Shots land in a thread-safe queue that the game loop drains. All
+responses are JSON with a "result" key because the tracker calls
+res.json()['result'] on the reply.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import queue
 import threading
+import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 SHOT_QUEUE: "queue.Queue[dict]" = queue.Queue()
@@ -27,9 +43,32 @@ SHOT_QUEUE: "queue.Queue[dict]" = queue.Queue()
 _SPEED_KEYS = ("ballspeed", "ball_speed", "speed", "mph")
 _HLA_KEYS = ("hla", "launchdirection", "launch_direction", "angle")
 
+_LOCK = threading.Lock()
+_TRACKER_STATUS: dict = {}
+_TRACKER_STATUS_TIME: float = 0.0
+_EVENTS: "deque[Tuple[float, str]]" = deque(maxlen=8)
+
+# latest webcam preview: (timestamp, jpeg_bytes, meta_dict, sequence)
+_PREVIEW: dict = {"time": 0.0, "jpg": None, "meta": {}, "seq": 0}
+
+
+def _log_event(msg: str) -> None:
+    with _LOCK:
+        _EVENTS.appendleft((time.time(), msg))
+
+
+def _flatten(src: dict, out: dict) -> None:
+    """Lowercase keys; recurse into nested dicts (tracker wraps its data
+    in a 'ballData' object)."""
+    for k, v in src.items():
+        if isinstance(v, dict):
+            _flatten(v, out)
+        else:
+            out[str(k).lower()] = v
+
 
 def _extract(params: dict) -> dict | None:
-    """params: lowercase-key -> first value (str or number)."""
+    """params: lowercase-key -> value (str or number)."""
     def pick(keys):
         for k in keys:
             if k in params and params[k] not in (None, ""):
@@ -47,12 +86,12 @@ def _extract(params: dict) -> dict | None:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "PuttQuest/0.1"
+    server_version = "PuttQuest/0.2"
 
-    def _ok(self, body: str = "OK") -> None:
-        data = body.encode()
+    def _ok(self) -> None:
+        data = b'{"result": "success"}'
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -61,10 +100,44 @@ class _Handler(BaseHTTPRequestHandler):
         q = parse_qs(urlparse(self.path).query)
         return {k.lower(): v[0] for k, v in q.items() if v}
 
-    def do_GET(self) -> None:          # noqa: N802
-        shot = _extract(self._params_from_query())
+    def _handle(self, params: dict) -> None:
+        global _TRACKER_STATUS_TIME
+        path = urlparse(self.path).path.rstrip("/")
+        if path.endswith("preview"):
+            self._store_preview(params)
+            return
+        if path.endswith("status"):
+            with _LOCK:
+                _TRACKER_STATUS.update(params)
+                _TRACKER_STATUS_TIME = time.time()
+            return
+        shot = _extract(params)
         if shot:
             SHOT_QUEUE.put(shot)
+            _log_event(f"shot  {shot['speed_mph']:.2f} mph  "
+                       f"hla {shot['hla_deg']:+.2f}")
+        elif params:
+            _log_event("rejected (no speed key): "
+                       + json.dumps(params, default=str)[:80])
+
+    def _store_preview(self, params: dict) -> None:
+        """A /preview post carries a base64 JPEG in 'frame' plus small
+        metadata (ready flag, lock fraction, tracker state)."""
+        frame_b64 = params.pop("frame", None)
+        if not frame_b64:
+            return
+        try:
+            jpg = base64.b64decode(frame_b64)
+        except (ValueError, TypeError):
+            return
+        with _LOCK:
+            _PREVIEW["time"] = time.time()
+            _PREVIEW["jpg"] = jpg
+            _PREVIEW["meta"] = dict(params)
+            _PREVIEW["seq"] += 1
+
+    def do_GET(self) -> None:          # noqa: N802
+        self._handle(self._params_from_query())
         self._ok()
 
     def do_POST(self) -> None:         # noqa: N802
@@ -77,17 +150,14 @@ class _Handler(BaseHTTPRequestHandler):
                 if "json" in ctype or body.lstrip()[:1] in (b"{", b"["):
                     data = json.loads(body)
                     if isinstance(data, dict):
-                        params.update({str(k).lower(): v
-                                       for k, v in data.items()})
+                        _flatten(data, params)
                 else:
                     form = parse_qs(body.decode(errors="replace"))
                     params.update({k.lower(): v[0]
                                    for k, v in form.items() if v})
             except (ValueError, UnicodeDecodeError):
-                pass
-        shot = _extract(params)
-        if shot:
-            SHOT_QUEUE.put(shot)
+                _log_event(f"unparseable body ({len(body)} bytes)")
+        self._handle(params)
         self._ok()
 
     def log_message(self, *args) -> None:  # silence per-request stderr spam
@@ -125,3 +195,29 @@ class ShotListener:
             return SHOT_QUEUE.get_nowait()
         except queue.Empty:
             return None
+
+    @staticmethod
+    def get_tracker_status() -> Tuple[Optional[float], dict]:
+        """Returns (seconds since last /status ping or None, status dict)."""
+        with _LOCK:
+            if not _TRACKER_STATUS_TIME:
+                return None, {}
+            return time.time() - _TRACKER_STATUS_TIME, dict(_TRACKER_STATUS)
+
+    @staticmethod
+    def get_events() -> List[Tuple[float, str]]:
+        with _LOCK:
+            return list(_EVENTS)
+
+    @staticmethod
+    def get_preview() -> Tuple[Optional[float], Optional[bytes], dict, int]:
+        """Returns (age_secs or None, jpeg_bytes or None, meta, sequence).
+
+        `sequence` bumps on each new frame so callers can avoid re-decoding
+        an unchanged image.
+        """
+        with _LOCK:
+            if not _PREVIEW["time"]:
+                return None, None, {}, 0
+            return (time.time() - _PREVIEW["time"], _PREVIEW["jpg"],
+                    dict(_PREVIEW["meta"]), _PREVIEW["seq"])

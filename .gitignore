@@ -5,3 +5,5 @@
 dist/
 readme-priv.md
 .vscode
+__pycache__/
+putt_quest_settings.json
