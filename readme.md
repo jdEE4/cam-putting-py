@@ -68,6 +68,28 @@ A single window with big clickable buttons walks you through three steps:
 > frame, which on Windows DirectShow throttled the loop to ~30fps regardless of
 > the actual sensor speed - if you saw 30fps there, that was the tool, not the cam.
 
+### Set the start zone + putt direction visually
+
+```
+run_setup_gui.bat            (Windows)
+./run_setup_gui.sh           (macOS/Linux)
+```
+
+Instead of guessing at trackbars, this shows the live camera at the exact scale
+the tracker uses and lets you:
+
+- **Drag a box** on the video to drop the start zone right on your resting ball.
+- Click **Auto-Detect** and **roll a putt** - it measures which way the ball
+  actually travels in the frame and sets the direction (left-to-right or
+  right-to-left) for you. If it reports the ball moves *vertically*, rotate the
+  camera so the putt runs across the width of the frame.
+- Watch the live **READY -> PUTT** overlay to confirm the direction is right
+  before launching `ball_tracking.py`.
+
+Save writes the zone and direction into `config.ini`. You can still fine-tune
+the same values live in the tracker's Advanced Settings (`a`), including the
+**Putt Dir 0=L-R 1=R-L** slider.
+
 ### Advanced: probe + keyboard tuner
 
 ```
