@@ -46,18 +46,38 @@ only reach that if two things are true:
    long shutter and silently halves your frame rate. This is the most common cause
    of a camera that reports 60 fps but delivers ~30.
 
-Use the tuning tool to verify and fix both:
+### Easiest: the guided calibration GUI
+
+```
+run_calibrate_gui.bat        (Windows)
+./run_calibrate_gui.sh       (macOS/Linux)
+```
+
+A single window with big clickable buttons walks you through three steps:
+
+1. **Frame rate** - shows the honest MEASURED fps (green when you hit target).
+   Exposure buttons (Darker/Brighter/Auto/Reset) are here if you need them.
+2. **Find the orange ball** - set your ball on the mat and click the orange
+   preset that circles it cleanly; Looser/Tighter widen or narrow detection.
+   The live ball radius readout tells you if the camera distance is right.
+3. **Save** - writes exposure and the chosen ball color into `config.ini`, which
+   `ball_tracking.py` then uses automatically.
+
+> Note: this GUI reads the camera properties only when you change something, so
+> the fps number is accurate. The older `camera_tune.py` polled the driver every
+> frame, which on Windows DirectShow throttled the loop to ~30fps regardless of
+> the actual sensor speed - if you saw 30fps there, that was the tool, not the cam.
+
+### Advanced: probe + keyboard tuner
 
 ```
 run_camera_tune.bat --probe          (scan which resolution/fps modes really work)
-run_camera_tune.bat                  (live view with MEASURED fps readout)
+run_camera_tune.bat                  (keyboard-driven live view)
 ```
 
-In the live view press `a` to switch to manual exposure, then step exposure down
-with `e` until the measured fps holds your target, adding light or gain (`G`) to
-keep the ball bright. Press `s` to save the values into `config.ini` -
-`ball_tracking.py` applies them on startup. `width`, `height` and `fps` in
-`config.ini` pin the camera mode (e.g. `640 x 480 @ 60`).
+In the live view press `a` for manual exposure, `e`/`E` to step exposure, `r` to
+reset to auto if the image goes black, and `s` to save. `width`, `height` and
+`fps` in `config.ini` pin the camera mode (e.g. `1280 x 720 @ 60`).
 
 ## Ball detection / calibration tips
 
