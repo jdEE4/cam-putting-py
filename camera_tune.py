@@ -16,9 +16,10 @@
 # Keys in the live view:
 #   e / E   exposure down / up          g / G   gain down / up
 #   b / B   brightness down / up        a       toggle auto exposure
+#   r       reset: hand exposure back to auto (recover from a black screen)
 #   m       toggle ball mask + radius preview
 #   c       open driver settings dialog (Windows DirectShow only)
-#   s       save current camera values to config.ini
+#   s       save current camera values to config.ini (skipped if frame is black)
 #   q       quit without saving
 
 import argparse
@@ -236,7 +237,7 @@ def main():
                     cap.get(cv2.CAP_PROP_FRAME_HEIGHT), backend_label(cap)), 1)
         put_line(display, "exposure %.2f (e/E)  gain %.1f (g/G)  brightness %.1f (b/B)"
                  % (exposure, gain, brightness), 2)
-        put_line(display, "autoexposure %.2f (a toggles)  mask (m)  save (s)  quit (q)" % autoexposure, 3)
+        put_line(display, "autoexposure %.2f (a toggles, r resets)  mask (m)  save (s)  quit (q)" % autoexposure, 3)
         if not fps_ok and measured > 0:
             put_line(display, "below target: shorten exposure (e) or add light", 4, (0, 255, 255))
 
@@ -275,6 +276,11 @@ def main():
             # OpenCV convention: 0.25 = manual, 0.75 = auto
             current = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if current != 0.25 else 0.75)
+        elif key == ord('r'):
+            # panic reset: hand exposure back to the camera's auto so a
+            # blacked-out manual setting is always recoverable without a restart
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+            print("Reset: auto exposure re-enabled")
         elif key == ord('m'):
             show_mask = not show_mask
             if not show_mask:
@@ -282,19 +288,27 @@ def main():
         elif key == ord('c') and is_windows:
             cap.set(cv2.CAP_PROP_SETTINGS, 37)
         elif key == ord('s'):
-            if not parser.has_section('putting'):
-                parser.add_section('putting')
-            parser.set('putting', 'exposure', str(cap.get(cv2.CAP_PROP_EXPOSURE)))
-            parser.set('putting', 'gain', str(cap.get(cv2.CAP_PROP_GAIN)))
-            parser.set('putting', 'brightness', str(cap.get(cv2.CAP_PROP_BRIGHTNESS)))
-            parser.set('putting', 'autoexposure', str(cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)))
-            if args.width and args.height:
-                parser.set('putting', 'width', str(args.width))
-                parser.set('putting', 'height', str(args.height))
-            parser.set('putting', 'fps', str(args.fps))
-            with open(CFG_FILE, 'w') as f:
-                parser.write(f)
-            print("Saved camera settings to %s" % CFG_FILE)
+            # refuse to persist a broken state - a black or dead frame saved
+            # here would make ball_tracking.py start black on every launch
+            brightness_mean = float(frame.mean())
+            if brightness_mean < 5 or measured < 1:
+                print("NOT saving: frame looks black (mean %.1f) or fps is %.1f. "
+                      "Press 'r' to reset exposure, get a good image, then save."
+                      % (brightness_mean, measured))
+            else:
+                if not parser.has_section('putting'):
+                    parser.add_section('putting')
+                parser.set('putting', 'exposure', str(cap.get(cv2.CAP_PROP_EXPOSURE)))
+                parser.set('putting', 'gain', str(cap.get(cv2.CAP_PROP_GAIN)))
+                parser.set('putting', 'brightness', str(cap.get(cv2.CAP_PROP_BRIGHTNESS)))
+                parser.set('putting', 'autoexposure', str(cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)))
+                if args.width and args.height:
+                    parser.set('putting', 'width', str(args.width))
+                    parser.set('putting', 'height', str(args.height))
+                parser.set('putting', 'fps', str(args.fps))
+                with open(CFG_FILE, 'w') as f:
+                    parser.write(f)
+                print("Saved camera settings to %s" % CFG_FILE)
 
     cap.release()
     cv2.destroyAllWindows()
