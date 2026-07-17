@@ -58,6 +58,9 @@ BTN_GO = (60, 120, 60)
 # buttons registered during draw, hit-tested by the mouse callback
 _buttons = []
 _pending = [None]
+# y-offset of the button panel within the composited canvas (panel is stacked
+# UNDER the preview, so click-zones must be stored in canvas coords, not panel coords)
+_panel_y = [0]
 
 
 def resolve_backend(name):
@@ -119,7 +122,8 @@ def draw_button(panel, x, y, w, h, label, action, color=BTN, enabled=True):
     ty = y + (h + size[1]) // 2
     cv2.putText(panel, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ink, 1, cv2.LINE_AA)
     if enabled:
-        _buttons.append((x, y, w, h, action))
+        # store the hit-zone in canvas coords (panel sits below the preview)
+        _buttons.append((x, y + _panel_y[0], w, h, action))
 
 
 def text(img, s, x, y, color=INK, scale=0.6, thick=1):
@@ -220,15 +224,23 @@ def main():
         # ---- build the button panel ----
         panel = np.full((PANEL_H, pw, 3), BG, np.uint8)
         _buttons.clear()
+        _panel_y[0] = ph        # panel is stacked under the preview at y = ph
 
         if step == 1:
-            text(panel, "Is the FPS number green and near %d? If yes, click Next." % args.fps, 16, 26, INK, 0.5)
-            text(panel, "If it is stuck low with a bright image, it is not exposure - tell Claude.", 16, 46, WARN, 0.45)
-            draw_button(panel, 16, 60, 150, 60, "Auto Exp: %s" % ("ON" if cam['auto'] > 0.5 else "OFF"), "auto")
-            draw_button(panel, 176, 60, 120, 60, "Darker", "exp_down")
-            draw_button(panel, 306, 60, 120, 60, "Brighter", "exp_up")
-            draw_button(panel, 436, 60, 120, 60, "Reset", "reset")
-            draw_button(panel, pw - 150, 60, 134, 60, "Next  >", "next", BTN_GO)
+            text(panel, "60 FPS but dark is normal - a short shutter is what keeps 60fps.", 16, 18, INK, 0.46)
+            text(panel, "Gain+ brightens without losing fps. Brighter uses exposure (may drop fps). Best: add light.",
+                 16, 36, WARN, 0.42)
+            text(panel, "exp %.0f   gain %.0f   auto %s" %
+                 (cam['exposure'], cam['gain'], "ON" if cam['auto'] > 0.5 else "OFF"), 16, 54, GOOD, 0.44)
+            # row 1: brightness controls
+            draw_button(panel, 16, 62, 120, 40, "Gain +", "gain_up")
+            draw_button(panel, 144, 62, 120, 40, "Gain -", "gain_down")
+            draw_button(panel, 272, 62, 120, 40, "Brighter", "exp_up")
+            draw_button(panel, 400, 62, 120, 40, "Darker", "exp_down")
+            # row 2: auto / reset / next
+            draw_button(panel, 16, 106, 150, 38, "Auto Exp: %s" % ("ON" if cam['auto'] > 0.5 else "OFF"), "auto")
+            draw_button(panel, 174, 106, 130, 38, "Reset (auto)", "reset")
+            draw_button(panel, pw - 160, 106, 144, 38, "Next  >", "next", BTN_GO)
         elif step == 2:
             text(panel, "Put the ORANGE ball on the mat. Pick the preset that circles it cleanly.", 16, 26, INK, 0.5)
             bw = 118
@@ -276,6 +288,14 @@ def main():
         elif action == 'exp_up':
             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
             cap.set(cv2.CAP_PROP_EXPOSURE, cam['exposure'] + 1)
+            refresh_cam()
+        elif action == 'gain_up':
+            # gain amplifies the signal without lengthening the shutter, so it
+            # brightens the image while keeping the frame rate at 60
+            cap.set(cv2.CAP_PROP_GAIN, cam['gain'] + 8)
+            refresh_cam()
+        elif action == 'gain_down':
+            cap.set(cv2.CAP_PROP_GAIN, cam['gain'] - 8)
             refresh_cam()
         elif action == 'reset':
             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
