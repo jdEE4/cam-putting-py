@@ -133,6 +133,13 @@ if parser.has_option('putting', 'backend'):
     backendname=parser.get('putting', 'backend')
 else:
     backendname='auto'
+if parser.has_option('putting', 'direction'):
+    direction=parser.get('putting', 'direction').strip().lower()
+else:
+    direction='lefttoright'
+# pdir folds the putt direction into every axis comparison: +1 = ball travels
+# left-to-right (default, legacy behavior), -1 = right-to-left
+pdir = -1 if direction == 'righttoleft' else 1
 if parser.has_option('putting', 'customhsv'):
     customhsv=ast.literal_eval(parser.get('putting', 'customhsv'))
     print(customhsv)
@@ -157,7 +164,10 @@ else:
 
 # Globals
 
-# Detection Gateway
+# Detection Gateway - placed just downstream of the start zone. For a
+# left-to-right putt that is to the RIGHT of sx2; for right-to-left it is to
+# the LEFT of sx1. recomputeGateway() keeps x1/x2/coord in sync with the
+# current start zone and direction.
 x1=sx2+10
 x2=x1+10
 
@@ -166,6 +176,21 @@ startcoord=[[sx1,y1],[sx2,y1],[sx1,y2],[sx2,y2]]
 
 #coord of polygon in frame::: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
 coord=[[x1,y1],[x2,y1],[x1,y2],[x2,y2]]
+
+def recomputeGateway():
+    global x1, x2
+    if pdir == 1:
+        x1 = sx2 + 10
+        x2 = x1 + 10
+    else:
+        x1 = sx1 - 10
+        x2 = x1 - 10
+    coord[0][0] = x1
+    coord[2][0] = x1
+    coord[1][0] = x2
+    coord[3][0] = x2
+
+recomputeGateway()
 
 golfballradius = 21.33; # in mm
 
@@ -593,7 +618,9 @@ def setXStart(value):
     startcoord[2][0]=value
 
     global sx1
-    sx1=int(value)    
+    sx1=int(value)
+    # the gateway hangs off sx1 when the putt runs right-to-left
+    recomputeGateway()
     parser.set('putting', 'startx1', str(sx1))
     parser.write(open(CFG_FILE, "w"))
     pass
@@ -601,26 +628,25 @@ def setXStart(value):
 def setXEnd(value):
     print(value)
     startcoord[1][0]=value
-    startcoord[3][0]=value 
+    startcoord[3][0]=value
 
-    global x1
-    global x2
     global sx2
-     
-    # Detection Gateway
-    x1=int(value+10)
-    x2=int(x1+10)
-
-    #coord=[[x1,y1],[x2,y1],[x1,y2],[x2,y2]]
-    coord[0][0]=x1
-    coord[2][0]=x1
-    coord[1][0]=x2
-    coord[3][0]=x2
-
-    sx2=int(value)    
+    sx2=int(value)
+    # the gateway hangs off sx2 when the putt runs left-to-right
+    recomputeGateway()
     parser.set('putting', 'startx2', str(sx2))
     parser.write(open(CFG_FILE, "w"))
-    pass  
+    pass
+
+def setDirection(value):
+    global direction, pdir
+    direction = 'righttoleft' if int(value) == 1 else 'lefttoright'
+    pdir = -1 if direction == 'righttoleft' else 1
+    recomputeGateway()
+    parser.set('putting', 'direction', direction)
+    parser.write(open(CFG_FILE, "w"))
+    print("Putt direction: " + direction)
+    pass
 
 def setYStart(value):
     print(value)
@@ -714,11 +740,15 @@ def setDarkness(value):
 def GetAngle (p1, p2):
     x1, y1 = p1
     x2, y2 = p2
-    dX = x2 - x1
+    # fold the putt direction in so "forward" is always +x: for a right-to-left
+    # putt dX is negated, and (like a mirror / flipImage) the angle sign inverts
+    dX = (x2 - x1) * pdir
     dY = y2 - y1
     rads = math.atan2 (-dY, dX)
+    if pdir == -1:
+        rads = rads*-1
 
-    if flipImage == 1 and videofile == False:    	
+    if flipImage == 1 and videofile == False:
         rads = rads*-1
     return math.degrees (rads)
 
@@ -940,7 +970,15 @@ while True:
 
 
 
-    mask = mask[y1:y2, sx1:640]
+    # Crop the search region to the side the putt actually travels: from the
+    # start zone rightward for L-R, or from the left edge to the start zone for
+    # R-L. maskxoff is added back to contour x so coords stay in frame space.
+    if pdir == 1:
+        maskxoff = sx1
+        mask = mask[y1:y2, sx1:mask.shape[1]]
+    else:
+        maskxoff = 0
+        mask = mask[y1:y2, 0:sx2]
 
     # Mask now comes from ColorFinder
     #mask = cv2.erode(mask, None, iterations=1)
@@ -996,7 +1034,7 @@ while True:
             radius = 0
             # Eliminate countours that are outside the y dimensions of the detection zone
             ((tempcenterx, tempcentery), tempradius) = cv2.minEnclosingCircle(cnts[index])
-            tempcenterx = tempcenterx + sx1
+            tempcenterx = tempcenterx + maskxoff
             tempcentery = tempcentery + y1
             if (tempcentery >= y1 and tempcentery <= y2):
                 rangefactor = 50
@@ -1086,7 +1124,7 @@ while True:
 
                         else:
 
-                            if (x >= coord[0][0] and entered == False and started == True):
+                            if (pdir*(x - coord[0][0]) >= 0 and entered == False and started == True):
                                 cv2.line(frame, (coord[0][0], coord[0][1]), (coord[2][0], coord[2][1]), (0, 255, 0),2)  # Changes line color to green
                                 tim1 = frameTime
                                 print("Ball Entered. Position: "+str(center))
@@ -1098,7 +1136,7 @@ while True:
                                 
                                 break
                             else:
-                                if ( x > coord[1][0] and entered == True and started == True):
+                                if ( pdir*(x - coord[1][0]) > 0 and entered == True and started == True):
                                     #calculate hla for circle and pts[0]
                                     previousHLA = (GetAngle((startCircle[0],startCircle[1]),pts[0])*-1)
                                     #calculate hla for circle and now
@@ -1114,7 +1152,7 @@ while True:
                                             similarHLA = False
                                     else:
                                         similarHLA = True
-                                    if ( x > (pts[0][0]+50)and similarHLA == True): # and (pow((y - (pts[0][1])), 2)) <= pow((y - (pts[1][1])), 2) 
+                                    if ( pdir*(x - pts[0][0]) > 50 and similarHLA == True): # and (pow((y - (pts[0][1])), 2)) <= pow((y - (pts[1][1])), 2)
                                         cv2.line(frame, (coord[1][0], coord[1][1]), (coord[3][0], coord[3][1]), (0, 255, 0),2)  # Changes line color to green
                                         tim2 = frameTime # Final time
                                         print("Ball Left. Position: "+str(center))
@@ -1265,10 +1303,12 @@ while True:
     if not lastShotSpeed == 0:
         cv2.line(frame,(lastShotStart),(lastShotEnd),(0, 255, 255),4,cv2.LINE_AA)      
     
+    # aim guide points downstream from the start zone edge the ball leaves from
+    aimx = sx2 if pdir == 1 else sx1
     if started:
-        cv2.line(frame,(sx2,startCircle[1]),(sx2+400,startCircle[1]),(255, 255, 255),4,cv2.LINE_AA)
+        cv2.line(frame,(aimx,startCircle[1]),(aimx+400*pdir,startCircle[1]),(255, 255, 255),4,cv2.LINE_AA)
     else:
-        cv2.line(frame,(sx2,int(y1+((y2-y1)/2))),(sx2+400,int(y1+((y2-y1)/2))),(255, 255, 255),4,cv2.LINE_AA) 
+        cv2.line(frame,(aimx,int(y1+((y2-y1)/2))),(aimx+400*pdir,int(y1+((y2-y1)/2))),(255, 255, 255),4,cv2.LINE_AA)
 
         # Mark Start Circle (green while armed and waiting for the putt,
         # red once the ball is moving)
@@ -1513,6 +1553,7 @@ while True:
             cv2.createTrackbar("X End", "Advanced Settings", int(sx2), 640, setXEnd)
             cv2.createTrackbar("Y Start", "Advanced Settings", int(y1), 460, setYStart)
             cv2.createTrackbar("Y End", "Advanced Settings", int(y2), 460, setYEnd)
+            cv2.createTrackbar("Putt Dir 0=L-R 1=R-L", "Advanced Settings", 1 if pdir == -1 else 0, 1, setDirection)
             cv2.createTrackbar("Radius", "Advanced Settings", int(ballradius), 50, setBallRadius)
             cv2.createTrackbar("Flip Image", "Advanced Settings", int(flipImage), 1, setFlip)
             cv2.createTrackbar("Flip View", "Advanced Settings", int(flipView), 1, setFlipView)
