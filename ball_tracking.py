@@ -6,6 +6,7 @@ import cv2
 import imutils
 import time
 import sys
+import platform
 import cvzone
 from ColorModuleExtended import ColorFinder
 import math
@@ -128,6 +129,10 @@ if parser.has_option('putting', 'previewstream'):
     previewstream=int(parser.get('putting', 'previewstream'))
 else:
     previewstream=1
+if parser.has_option('putting', 'backend'):
+    backendname=parser.get('putting', 'backend')
+else:
+    backendname='auto'
 if parser.has_option('putting', 'customhsv'):
     customhsv=ast.literal_eval(parser.get('putting', 'customhsv'))
     print(customhsv)
@@ -359,22 +364,48 @@ if args.get("camera", False):
     webcamindex = args["camera"]
     print("Putting Cam activated at "+str(webcamindex))
 
+# Camera backend selection: 'auto' uses DirectShow on Windows (needed for
+# the driver settings dialog and reliable MJPG 60fps modes) and the OS
+# default everywhere else (AVFoundation on macOS). Overwrite in config.ini
+# with backend = dshow | msmf | avfoundation | v4l2 | any
+CAMERA_BACKENDS = {
+    'any': cv2.CAP_ANY,
+    'dshow': cv2.CAP_DSHOW,
+    'msmf': cv2.CAP_MSMF,
+    'avfoundation': cv2.CAP_AVFOUNDATION,
+    'v4l2': cv2.CAP_V4L2,
+}
+
+def resolveCameraBackend(name):
+    name = (name or 'auto').strip().lower()
+    if name in CAMERA_BACKENDS:
+        return CAMERA_BACKENDS[name]
+    if platform.system() == 'Windows':
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+
+def openCamera(index):
+    if mjpegenabled == 0:
+        return cv2.VideoCapture(index)
+    cap = cv2.VideoCapture(index, resolveCameraBackend(backendname))
+    # Request MJPG before resolution and FPS - many webcams only unlock
+    # their 60+ fps modes on the compressed stream and ignore FPS
+    # requests made while still in the uncompressed default format
+    mjpeg = cv2.VideoWriter_fourcc('M','J','P','G')
+    cap.set(cv2.CAP_PROP_FOURCC, mjpeg)
+    if height != 0 and width != 0:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    # Check if FPS is overwritten in config
+    if overwriteFPS != 0:
+        cap.set(cv2.CAP_PROP_FPS, overwriteFPS)
+        print("Overwrite FPS: "+str(cap.get(cv2.CAP_PROP_FPS)))
+    return cap
+
 # if a video path was not supplied, grab the reference
 # to the webcam
 if not args.get("video", False):
-    if mjpegenabled == 0:
-        vs = cv2.VideoCapture(webcamindex)
-    else:
-        vs = cv2.VideoCapture(webcamindex + cv2.CAP_DSHOW)
-        # Check if FPS is overwritten in config
-        if overwriteFPS != 0:
-            vs.set(cv2.CAP_PROP_FPS, overwriteFPS)
-            print("Overwrite FPS: "+str(vs.get(cv2.CAP_PROP_FPS)))
-        if height != 0 and width != 0:
-            vs.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            vs.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        mjpeg = cv2.VideoWriter_fourcc('M','J','P','G')
-        vs.set(cv2.CAP_PROP_FOURCC, mjpeg)
+    vs = openCamera(webcamindex)
     if vs.get(cv2.CAP_PROP_BACKEND) == -1:
         message = "No Camera could be opened at webcamera index "+str(webcamindex)+". If your webcam only supports compressed format MJPEG instead of YUY2 please set MJPEG option to 1"
     else:
@@ -463,22 +494,29 @@ if parser.has_option('putting', 'autofocus'):
 else:
     autofocus = vs.get(cv2.CAP_PROP_AUTOFOCUS)
 
-vs.set(cv2.CAP_PROP_SATURATION,saturation)
-vs.set(cv2.CAP_PROP_EXPOSURE,exposure)
-vs.set(cv2.CAP_PROP_AUTO_WB,autowb)
-vs.set(cv2.CAP_PROP_WHITE_BALANCE_BLUE_U,whiteBalanceBlue)
-vs.set(cv2.CAP_PROP_WHITE_BALANCE_RED_V,whiteBalanceRed)
-vs.set(cv2.CAP_PROP_BRIGHTNESS,brightness)
-vs.set(cv2.CAP_PROP_CONTRAST,contrast)
-vs.set(cv2.CAP_PROP_HUE,hue)
-vs.set(cv2.CAP_PROP_GAIN,gain)
-vs.set(cv2.CAP_PROP_MONOCHROME,monochrome)
-vs.set(cv2.CAP_PROP_SHARPNESS,sharpness)
-vs.set(cv2.CAP_PROP_AUTO_EXPOSURE,autoexposure)
-vs.set(cv2.CAP_PROP_GAMMA,gamma)
-vs.set(cv2.CAP_PROP_ZOOM,zoom)
-vs.set(cv2.CAP_PROP_FOCUS,focus)
-vs.set(cv2.CAP_PROP_AUTOFOCUS,autofocus)
+# Apply saved camera settings - a value of -1.0 means "not set" and is
+# skipped so the camera keeps its own default for that property
+def applyCameraProperty(prop, value):
+    if value is None or value == -1.0:
+        return
+    vs.set(prop, value)
+
+applyCameraProperty(cv2.CAP_PROP_SATURATION,saturation)
+applyCameraProperty(cv2.CAP_PROP_EXPOSURE,exposure)
+applyCameraProperty(cv2.CAP_PROP_AUTO_WB,autowb)
+applyCameraProperty(cv2.CAP_PROP_WHITE_BALANCE_BLUE_U,whiteBalanceBlue)
+applyCameraProperty(cv2.CAP_PROP_WHITE_BALANCE_RED_V,whiteBalanceRed)
+applyCameraProperty(cv2.CAP_PROP_BRIGHTNESS,brightness)
+applyCameraProperty(cv2.CAP_PROP_CONTRAST,contrast)
+applyCameraProperty(cv2.CAP_PROP_HUE,hue)
+applyCameraProperty(cv2.CAP_PROP_GAIN,gain)
+applyCameraProperty(cv2.CAP_PROP_MONOCHROME,monochrome)
+applyCameraProperty(cv2.CAP_PROP_SHARPNESS,sharpness)
+applyCameraProperty(cv2.CAP_PROP_AUTO_EXPOSURE,autoexposure)
+applyCameraProperty(cv2.CAP_PROP_GAMMA,gamma)
+applyCameraProperty(cv2.CAP_PROP_ZOOM,zoom)
+applyCameraProperty(cv2.CAP_PROP_FOCUS,focus)
+applyCameraProperty(cv2.CAP_PROP_AUTOFOCUS,autofocus)
 
 
 print("video_fps: "+str(video_fps))
@@ -496,19 +534,7 @@ if replaycam == 1:
 
 # replay is enabled start a 2nd video capture
 if replaycam == 1:
-    if mjpegenabled == 0:
-        vs2 = cv2.VideoCapture(replaycamindex)
-    else:
-        vs2 = cv2.VideoCapture(replaycamindex + cv2.CAP_DSHOW)
-        # Check if FPS is overwritten in config
-        if overwriteFPS != 0:
-            vs2.set(cv2.CAP_PROP_FPS, overwriteFPS)
-            print("Overwrite FPS: "+str(vs.get(cv2.CAP_PROP_FPS)))
-        if height != 0 and width != 0:
-            vs2.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            vs2.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        mjpeg = cv2.VideoWriter_fourcc('M','J','P','G')
-        vs2.set(cv2.CAP_PROP_FOURCC, mjpeg)
+    vs2 = openCamera(replaycamindex)
     if vs2.get(cv2.CAP_PROP_BACKEND) == -1:
         message = "No Camera could be opened at webcamera index "+str(replaycamindex)+". If your webcam only supports compressed format MJPEG instead of YUY2 please set MJPEG option to 1"
     else:
@@ -822,7 +848,7 @@ while True:
                     calObjectCount = 0
                     if colorcount == len(calibrationcolor):
                         vs.release()
-                        vs = cv2.VideoCapture(webcamindex)
+                        vs = openCamera(webcamindex)
                         videofile = False
                         #vs.set(cv2.CAP_PROP_FPS, 60)
                         ret, frame = vs.read()
@@ -1479,8 +1505,9 @@ while True:
 
         if not a_key_pressed:
             cv2.namedWindow("Advanced Settings")
-            if mjpegenabled != 0:
-                vs.set(cv2.CAP_PROP_SETTINGS, 37)  
+            # the driver settings dialog is a DirectShow feature - Windows only
+            if mjpegenabled != 0 and platform.system() == "Windows":
+                vs.set(cv2.CAP_PROP_SETTINGS, 37)
             cv2.resizeWindow("Advanced Settings", 1000, 440)
             cv2.createTrackbar("X Start", "Advanced Settings", int(sx1), 640, setXStart)
             cv2.createTrackbar("X End", "Advanced Settings", int(sx2), 640, setXEnd)

@@ -1,19 +1,79 @@
 # Webcam based putting simulation for GSPRO utilizing the R10 and MLM2Pro connector:
 
-## Quick start for putt_quest (macOS/Linux)
+## Quick start (Windows)
 
-Run this from the repository root:
+Double-click (or run from a terminal) the matching launcher in the repository root:
+
+| Launcher | What it starts |
+| --- | --- |
+| `run_ball_tracking.bat` | the putting tracker (`ball_tracking.py`) |
+| `run_ball_tracking_setup.bat` | the setup/alignment variant |
+| `run_camera_tune.bat` | webcam exposure / FPS tuning tool |
+| `run_putt_quest.bat` | the Putt Quest game |
+
+Each launcher creates `.venv` on first run, installs the requirements and starts the
+app - you only need Python 3 from [python.org](https://www.python.org/downloads/)
+(check "Add python.exe to PATH" in its installer).
+
+On Windows the camera is opened through DirectShow, which also enables the driver
+settings dialog from the Advanced Settings ("a") screen. The backend can be
+overwritten in `config.ini` with `backend = dshow | msmf | avfoundation | v4l2 | any`
+(default `auto`: DirectShow on Windows, OS default elsewhere).
+
+## Quick start (macOS/Linux)
+
+Run the matching script from the repository root - same behavior as the Windows
+launchers above:
 
 ```bash
-./run_putt_quest.sh
+./run_ball_tracking.sh        # putting tracker
+./run_ball_tracking_setup.sh  # setup/alignment variant
+./run_camera_tune.sh          # webcam exposure / FPS tuning tool
+./run_putt_quest.sh           # Putt Quest game
 ```
 
-The script will:
-- create `.venv` if needed
-- install `requirements-game.txt` if missing
-- launch `putt_quest`
-
 No global `python` or `py` command is required.
+
+## Reaching 60 FPS (exposure tuning)
+
+The tracker needs at least 60 fps for reliable speed reads. Most "60 fps" webcams
+only reach that if two things are true:
+
+1. **The stream is compressed (MJPG)** - keep `mjpeg = 1` in `config.ini`. Many
+   cameras only unlock their high-fps modes on the compressed format, and the code
+   now requests MJPG *before* resolution and FPS so the mode actually sticks.
+2. **The shutter time is shorter than 1/60s** - auto exposure in a dim room picks a
+   long shutter and silently halves your frame rate. This is the most common cause
+   of a camera that reports 60 fps but delivers ~30.
+
+Use the tuning tool to verify and fix both:
+
+```
+run_camera_tune.bat --probe          (scan which resolution/fps modes really work)
+run_camera_tune.bat                  (live view with MEASURED fps readout)
+```
+
+In the live view press `a` to switch to manual exposure, then step exposure down
+with `e` until the measured fps holds your target, adding light or gain (`G`) to
+keep the ball bright. Press `s` to save the values into `config.ini` -
+`ball_tracking.py` applies them on startup. `width`, `height` and `fps` in
+`config.ini` pin the camera mode (e.g. `640 x 480 @ 60`).
+
+## Ball detection / calibration tips
+
+- **Ball vs. mat**: the detector works in HSV color space - what matters is the
+  *hue* distance between ball and background. On a green mat an orange ball
+  (`-c orange2`) is the safest choice; avoid green/yellow-green balls on green mats.
+  A darker, matte mat beats a bright or shiny one.
+- **Mounting distance**: the speed calculation derives mm-per-pixel from the
+  detected ball radius. Mount the camera so the ball radius is roughly 8-20 px at
+  640px capture width (about 1 m of putting surface across the frame). The tuning
+  tool shows the live detected radius with `m` (mask preview) and tells you if the
+  distance is usable.
+- **Lighting**: light the ball from the camera side, avoid hard shadows across the
+  detection zone, and prefer more light + short exposure over auto exposure.
+- Use `d` (debug) in the tracker to fine-tune the HSV mask; the values are saved to
+  `config.ini` as `customhsv`.
 
 Calculation includes BallSpeed in MPH and HLA of the putt. Initial insperation on the solution comes from natter where I forked the initial OpenCV code.
 

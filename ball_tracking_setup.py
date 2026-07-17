@@ -88,6 +88,30 @@ if parser.has_option('putting', 'customhsv'):
     print(customhsv)
 else:
     customhsv={}
+if parser.has_option('putting', 'backend'):
+    backendname=parser.get('putting', 'backend')
+else:
+    backendname='auto'
+
+# Camera backend selection: 'auto' uses DirectShow on Windows (needed for
+# the driver settings dialog and reliable MJPG 60fps modes) and the OS
+# default everywhere else (AVFoundation on macOS). Overwrite in config.ini
+# with backend = dshow | msmf | avfoundation | v4l2 | any
+CAMERA_BACKENDS = {
+    'any': cv2.CAP_ANY,
+    'dshow': cv2.CAP_DSHOW,
+    'msmf': cv2.CAP_MSMF,
+    'avfoundation': cv2.CAP_AVFOUNDATION,
+    'v4l2': cv2.CAP_V4L2,
+}
+
+def resolveCameraBackend(name):
+    name = (name or 'auto').strip().lower()
+    if name in CAMERA_BACKENDS:
+        return CAMERA_BACKENDS[name]
+    if platform.system() == 'Windows':
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
 
 
 # Detection Gateway
@@ -320,19 +344,19 @@ if not args.get("video", False):
     if mjpegenabled == 0:
         vs = cv2.VideoCapture(webcamindex)
     else:
-        if platform.system() == "Windows":
-            vs = cv2.VideoCapture(webcamindex, cv2.CAP_DSHOW)
-        else:
-            vs = cv2.VideoCapture(webcamindex)
+        vs = cv2.VideoCapture(webcamindex, resolveCameraBackend(backendname))
+        # Request MJPG before resolution and FPS - many webcams only unlock
+        # their 60+ fps modes on the compressed stream and ignore FPS
+        # requests made while still in the uncompressed default format
+        mjpeg = cv2.VideoWriter_fourcc('M','J','P','G')
+        vs.set(cv2.CAP_PROP_FOURCC, mjpeg)
+        if height != 0 and width != 0:
+            vs.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            vs.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         # Check if FPS is overwritten in config
         if overwriteFPS != 0:
             vs.set(cv2.CAP_PROP_FPS, overwriteFPS)
             print("Overwrite FPS: "+str(vs.get(cv2.CAP_PROP_FPS)))
-        if height != 0 and width != 0:
-            vs.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            vs.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        mjpeg = cv2.VideoWriter_fourcc('M','J','P','G')
-        vs.set(cv2.CAP_PROP_FOURCC, mjpeg)
     if vs.get(cv2.CAP_PROP_BACKEND) == -1:
         message = "No Camera could be opened at webcamera index "+str(webcamindex)+". If your webcam only supports compressed format MJPEG instead of YUY2 please set MJPEG option to 1"
     else:
@@ -1069,8 +1093,9 @@ while True:
     if key == ord("a"):
         if not a_key_pressed:
             cv2.namedWindow("Advanced Settings")
-            if mjpegenabled != 0:
-                vs.set(cv2.CAP_PROP_SETTINGS, 37)  
+            # the driver settings dialog is a DirectShow feature - Windows only
+            if mjpegenabled != 0 and platform.system() == "Windows":
+                vs.set(cv2.CAP_PROP_SETTINGS, 37)
             cv2.resizeWindow("Advanced Settings", 1000, 440)
             cv2.createTrackbar("X Start", "Advanced Settings", int(sx1), 640, setXStart)
             cv2.createTrackbar("X End", "Advanced Settings", int(sx2), 640, setXEnd)
