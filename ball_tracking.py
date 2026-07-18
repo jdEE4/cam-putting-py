@@ -1417,7 +1417,7 @@ while True:
     if previewstream == 1 and (frameTime - _lastPreviewTime) > 0.09:
         _lastPreviewTime = frameTime
         try:
-            thumb = resizeWithAspectRatio(frame, width=240)
+            thumb = resizeWithAspectRatio(frame, width=320)
             ok_enc, buf = cv2.imencode('.jpg', thumb,
                                        [int(cv2.IMWRITE_JPEG_QUALITY), 55])
             if ok_enc:
@@ -1428,7 +1428,8 @@ while True:
                                               "ready": ballReady,
                                               "lock": round(lockProgress, 3),
                                               "state": trackerState,
-                                              "fps": round(fps, 1)}
+                                              "fps": round(fps, 1),
+                                              "dir": "L>R" if pdir == 1 else "R>L"}
                     PREVIEW_LATEST["seq"] += 1
         except Exception as e:
             print("preview encode error:", e)

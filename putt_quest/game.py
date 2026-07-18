@@ -119,6 +119,7 @@ class Game:
         # toggles
         self.debug = False
         self.show_minimap = True
+        self.camera_monitor = True   # live tracker view w/ zone confirmation
 
         # webcam preview decode cache
         self._pv_seq = -1
@@ -144,6 +145,7 @@ class Game:
                                          self.preset_idx))
             self.auto_scale = bool(data.get("auto_scale", True))
             self.show_minimap = bool(data.get("show_minimap", True))
+            self.camera_monitor = bool(data.get("camera_monitor", True))
         except (OSError, ValueError, TypeError):
             pass
 
@@ -152,7 +154,8 @@ class Game:
             with open(SETTINGS_PATH, "w") as fh:
                 json.dump({"preset_idx": self.preset_idx,
                            "auto_scale": self.auto_scale,
-                           "show_minimap": self.show_minimap}, fh)
+                           "show_minimap": self.show_minimap,
+                           "camera_monitor": self.camera_monitor}, fh)
         except OSError:
             pass
 
@@ -302,6 +305,11 @@ class Game:
         if key == pygame.K_m:
             self.show_minimap = not self.show_minimap
             self._save_settings()
+        if key == pygame.K_c:
+            self.camera_monitor = not self.camera_monitor
+            self.set_banner("Camera monitor " +
+                            ("ON" if self.camera_monitor else "OFF"))
+            self._save_settings()
         if key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS, pygame.K_PLUS):
             if self.preset_idx < len(gfx.RES_PRESETS) - 1:
                 self.apply_preset(self.preset_idx + 1)
@@ -406,6 +414,10 @@ class Game:
         self.draw_perf_readout()
         if self.debug:
             self.draw_debug()
+        # live tracker monitor: ball view + zone confirmation. Shown on the
+        # menu and during play so setup can be verified without leaving the game
+        if self.state != State.ROUND_DONE and (self.camera_monitor or self.debug):
+            self.draw_camera_panel()
         gfx.blit_scaled(self.win, self.canvas)
         pygame.display.flip()
 
@@ -451,8 +463,8 @@ class Game:
         gfx.status_dot(c, foot.x + gfx.sc(14), foot.y + gfx.sc(29), col)
         gfx.text(c, msg, foot.x + gfx.sc(24), foot.y + gfx.sc(23), col, 15)
 
-        gfx.text(c, "ENTER play   T test   [ ] resolution   G guard   "
-                    "D debug   Q quit",
+        gfx.text(c, "ENTER play   T test   C camera   [ ] resolution   "
+                    "G guard   D debug   Q quit",
                  W // 2, H - gfx.sc(18), gfx.HUD_DIM, 15, center=True)
 
     # ------------------------------------------------------------ hole
@@ -471,8 +483,8 @@ class Game:
         self.scene.draw(c, ball_pos, trail=self.trail[::3], t=self.time,
                         aim=aim, preview=preview)
 
-        # minimap (hidden when the debug camera panel occupies that corner)
-        if self.show_minimap and not self.debug:
+        # minimap (hidden when the camera panel occupies that corner)
+        if self.show_minimap and not (self.debug or self.camera_monitor):
             mm = pygame.Rect(W - gfx.sc(106), gfx.sc(8),
                              gfx.sc(98), gfx.sc(132))
             self.scene.draw_minimap(c, mm, ball_pos, self.trail[::3])
@@ -494,7 +506,10 @@ class Game:
                      head.x + gfx.sc(10), head.y + gfx.sc(42), gfx.INFO, 15)
 
         # score chip (drop below the minimap when it's shown)
-        chip_y = gfx.sc(146) if (self.show_minimap and not self.debug) else gfx.sc(8)
+        panel_corner = self.debug or self.camera_monitor
+        chip_y = gfx.sc(146) if (self.show_minimap and not panel_corner) else gfx.sc(8)
+        if panel_corner:
+            chip_y = gfx.sc(212)     # drop below the camera monitor
         chip = pygame.Rect(W - gfx.sc(106), chip_y, gfx.sc(98), gfx.sc(40))
         gfx.panel(c, chip)
         gfx.text(c, f"putt {score.putts + (self.state == State.AWAIT_PUTT)}",
@@ -620,7 +635,6 @@ class Game:
 
     # ----------------------------------------------------------- debug
     def draw_debug(self) -> None:
-        self.draw_camera_panel()
         c = self.canvas
         rect = pygame.Rect(gfx.sc(6), gfx.sc(76), gfx.sc(300), gfx.sc(190))
         gfx.panel(c, rect, alpha=215)
@@ -660,16 +674,18 @@ class Game:
                  f"{msg[:38]}", gfx.INFO)
 
     def draw_camera_panel(self) -> None:
-        """Live webcam thumbnail with a bold ready/lock state border."""
+        """Live tracker monitor: the annotated camera view (start zone,
+        gateway and ball circle are drawn by ball_tracking.py) plus a bold
+        ready/lock border, putt direction and camera fps."""
         c = self.canvas
         W = gfx.INTERNAL_W
-        pw, ph = gfx.sc(176), gfx.sc(120)
+        pw, ph = gfx.sc(236), gfx.sc(200)
         rect = pygame.Rect(W - pw - gfx.sc(6), gfx.sc(6), pw, ph)
         gfx.panel(c, rect, alpha=210)
         surf, meta, age = self._get_preview_surface()
 
         img_area = pygame.Rect(rect.x + gfx.sc(4), rect.y + gfx.sc(4),
-                               rect.w - gfx.sc(8), rect.h - gfx.sc(22))
+                               rect.w - gfx.sc(8), rect.h - gfx.sc(40))
         if surf is not None and age is not None and age < PREVIEW_FRESH_SECS:
             iw, ih = surf.get_size()
             scale = min(img_area.w / iw, img_area.h / ih)
@@ -695,9 +711,13 @@ class Game:
             pygame.draw.rect(c, bcol, (ix, iy, dw, dh), gfx.sc(3))
             lw = gfx.text_w(blabel, 15)
             gfx.status_dot(c, rect.centerx - lw // 2 - gfx.sc(8),
-                           rect.bottom - gfx.sc(10), bcol, r=4)
+                           rect.bottom - gfx.sc(30), bcol, r=4)
             gfx.text(c, blabel, rect.centerx + gfx.sc(4),
-                     rect.bottom - gfx.sc(16), bcol, 15, center=True)
+                     rect.bottom - gfx.sc(36), bcol, 15, center=True)
+            info = "putt dir %s   ·   cam %s fps" % (
+                meta.get("dir", "?"), meta.get("fps", "?"))
+            gfx.text(c, info, rect.centerx, rect.bottom - gfx.sc(18),
+                     gfx.HUD_DIM, 13, center=True)
         else:
             gfx.text(c, "CAMERA", rect.centerx, img_area.y + gfx.sc(6),
                      gfx.HUD_DIM, 15, center=True)
