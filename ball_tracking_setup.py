@@ -15,7 +15,7 @@ import requests
 from configparser import ConfigParser
 import ast
 
-parser = ConfigParser()
+parser = ConfigParser(strict=False)
 CFG_FILE = 'config.ini'
 
 parser.read(CFG_FILE)

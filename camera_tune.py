@@ -161,7 +161,7 @@ def put_line(img, text, row, color=(255, 255, 255)):
 
 
 def main():
-    parser = ConfigParser()
+    parser = ConfigParser(strict=False)
     parser.read(CFG_FILE)
 
     def cfg(option, fallback):

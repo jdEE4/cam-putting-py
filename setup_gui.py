@@ -120,7 +120,7 @@ def text(img, s, x, y, color=INK, scale=0.6, thick=1):
 
 
 def main():
-    parser = ConfigParser()
+    parser = ConfigParser(strict=False)
     parser.read(CFG_FILE)
 
     def cfg(opt, fb):

@@ -19,7 +19,7 @@ import shutil
 import threading
 import base64
 
-parser = ConfigParser()
+parser = ConfigParser(strict=False)
 CFG_FILE = 'config.ini'
 
 parser.read(CFG_FILE)
