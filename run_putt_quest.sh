@@ -16,7 +16,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   "$PYTHON_BIN" -m pip install --upgrade pip
 fi
 
-if ! "$PYTHON_BIN" -c "import pygame" >/dev/null 2>&1; then
+if ! "$PYTHON_BIN" -c "import pygame, numpy" >/dev/null 2>&1; then
   echo "Installing game dependencies from requirements-game.txt ..."
   "$PYTHON_BIN" -m pip install -r "$ROOT_DIR/requirements-game.txt"
 fi
