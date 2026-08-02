@@ -316,3 +316,28 @@ persists between runs. Command-line shortcuts still work:
   reticle is drawn on the green where your ball sits — sonar rings while the
   tracker searches, a filling arc while the ball locks, and a steady pulse
   with rotating ticks once it's READY.
+
+### If the executable doesn't start
+
+Run it from a terminal so you can see the output (a double-clicked exe that
+fails closes its window instantly):
+
+```powershell
+cd dist
+.\PuttQuest.exe --selftest > report.txt 2>&1
+notepad report.txt
+```
+
+The self-test lists the bundled tools, every import, the display/audio
+drivers and any cameras it can open, then says ALL CORE CHECKS PASSED or
+which check failed. Common causes:
+
+- **Nothing appears for 10-30 seconds** — normal. A one-file bundle unpacks
+  itself on every launch. The console prints "Putt Quest — starting up..."
+  immediately, so if you see that, it is working.
+- **Windows SmartScreen / antivirus** — unsigned PyInstaller executables are
+  frequently blocked or quarantined. Check Defender's Protection History and
+  allow the file, or click "More info" -> "Run anyway" on the SmartScreen
+  dialog.
+- **A crash** — `puttquest-crash.log` is written next to the exe with the
+  full traceback, and the console stays open so you can read it.

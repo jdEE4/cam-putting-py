@@ -518,3 +518,50 @@ def test_app_spec_lists_every_runtime_dependency():
                 "pygame", "putt_quest.game", "putt_quest.sounds"):
         assert f"'{mod}'" in spec, f"{mod} missing from hiddenimports"
 
+
+
+def test_child_env_strips_pyinstaller_vars():
+    """A frozen app re-launching itself must not leak the parent's
+    bootloader vars to the child, or the child resolves the wrong bundle."""
+    import putt_quest_app as app
+    dirty = {"_PYI_ARCHIVE_FILE": "/bogus", "_PYI_APPLICATION_HOME_DIR": "/x",
+             "_MEIPASS2": "/y", "PATH": os.environ.get("PATH", "")}
+    old = dict(os.environ)
+    try:
+        os.environ.update(dirty)
+        env = app.child_env()
+        assert not [k for k in env if k.startswith("_PYI")]
+        assert "_MEIPASS2" not in env
+        assert "PATH" in env          # normal vars survive
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
+
+def test_selftest_runs_and_reports(capsys):
+    """--selftest must never raise: it is the tool used to debug a machine
+    where the exe won't start."""
+    import putt_quest_app as app
+    rc = app.selftest()
+    out = capsys.readouterr().out
+    assert rc in (0, 1)
+    for section in ("bundled tools", "imports", "display / audio",
+                    "cameras"):
+        assert section in out
+    for tool in app.TOOLS.values():
+        assert tool in out
+
+
+def test_build_script_quotes_version_specifier():
+    """An unquoted '>=' in a .bat pip install is read by cmd as a redirect
+    and silently writes a junk file instead of pinning the version."""
+    import putt_quest_app as app
+    root = os.path.dirname(os.path.abspath(app.__file__))
+    bat = open(os.path.join(root, "build_exe.bat")).read()
+    for line in bat.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("rem"):
+            continue
+        if "pip install" in stripped:
+            unquoted = stripped.replace('"', "")
+            assert ">" not in unquoted, f"unquoted redirect in: {stripped}"

@@ -105,16 +105,31 @@ def run_tool(tool: str, argv: list) -> int:
     return 0
 
 
+def child_env() -> dict:
+    """Environment for a re-launch of this same frozen executable.
+
+    PyInstaller's bootloader exports private variables (_PYI_..., _MEIPASS2)
+    describing the *parent's* unpacked bundle. A child that inherits them
+    thinks it is already unpacked, looks in the wrong place and dies
+    immediately - so they must be stripped before spawning ourselves.
+    """
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith("_PYI") or key in ("_MEIPASS2", "_MEIPASS"):
+            del env[key]
+    return env
+
+
 def spawn_self(args: list) -> subprocess.Popen:
     """Re-launch this same executable with different arguments."""
     if frozen():
         cmd = [sys.executable] + args
     else:
         cmd = [sys.executable, os.path.abspath(__file__)] + args
-    creation = 0
+    kwargs = {"cwd": os.getcwd(), "env": child_env()}
     if os.name == "nt":
-        creation = subprocess.CREATE_NEW_CONSOLE
-    return subprocess.Popen(cmd, cwd=os.getcwd(), creationflags=creation)
+        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+    return subprocess.Popen(cmd, **kwargs)
 
 
 def play(with_tracker: bool = True) -> int:
@@ -214,6 +229,108 @@ def launcher() -> int:
         clock.tick(60)
 
 
+def selftest() -> int:
+    """Print everything needed to diagnose a launch problem, and exit.
+
+    Run `PuttQuest.exe --selftest > report.txt 2>&1` and send the file."""
+    ok = True
+    print("=" * 58)
+    print(" Putt Quest self-test")
+    print("=" * 58)
+    print(f"frozen        : {frozen()}")
+    print(f"executable    : {sys.executable}")
+    print(f"bundle dir    : {bundle_dir()}")
+    print(f"work dir      : {os.getcwd()}")
+    print(f"python        : {sys.version.split()[0]}")
+    print(f"platform      : {sys.platform}")
+
+    print("\n-- bundled tools --")
+    for name, script in sorted(TOOLS.items()):
+        path = os.path.join(bundle_dir(), script)
+        found = os.path.exists(path)
+        ok &= found
+        print(f"  {'OK ' if found else 'MISSING'}  {name:<10} {script}")
+
+    print("\n-- runtime files (written next to the exe) --")
+    for name in RUNTIME_FILES:
+        p = os.path.join(os.getcwd(), name)
+        print(f"  {'OK ' if os.path.exists(p) else 'absent '}  {name}")
+
+    print("\n-- imports --")
+    for mod in ("pygame", "numpy", "cv2", "requests", "cvzone", "imutils",
+                "putt_quest.game", "putt_quest.sounds"):
+        try:
+            __import__(mod)
+            print(f"  OK       {mod}")
+        except Exception as exc:                     # noqa: BLE001
+            ok = False
+            print(f"  FAILED   {mod}: {exc}")
+
+    print("\n-- display / audio --")
+    try:
+        import pygame
+        pygame.display.init()
+        print(f"  OK       video driver: {pygame.display.get_driver()}")
+        pygame.display.quit()
+    except Exception as exc:                         # noqa: BLE001
+        ok = False
+        print(f"  FAILED   pygame display: {exc}")
+    try:
+        import pygame
+        pygame.mixer.init()
+        print("  OK       audio device present")
+        pygame.mixer.quit()
+    except Exception as exc:                         # noqa: BLE001
+        print(f"  none     no audio device ({exc}) - game still runs")
+
+    print("\n-- cameras --")
+    try:
+        import cv2
+        found_any = False
+        for idx in range(3):
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                print(f"  OK       camera {idx}: {w:.0f}x{h:.0f}")
+                found_any = True
+            cap.release()
+        if not found_any:
+            print("  none     no camera opened (GAME ONLY mode still works)")
+    except Exception as exc:                         # noqa: BLE001
+        print(f"  FAILED   opencv camera probe: {exc}")
+
+    print("\n" + ("ALL CORE CHECKS PASSED" if ok else "SOME CHECKS FAILED"))
+    return 0 if ok else 1
+
+
+def report_crash(exc: BaseException) -> None:
+    """Write a crash log next to the exe and keep the console readable.
+
+    A double-clicked exe closes its console the instant it dies, so without
+    this a failure is completely invisible to the player."""
+    import traceback
+    text = "".join(traceback.format_exception(type(exc), exc,
+                                              exc.__traceback__))
+    banner = (f"Putt Quest {'(packaged)' if frozen() else '(source)'} "
+              f"crashed:\n\n{text}\n"
+              f"python: {sys.version}\ncwd: {os.getcwd()}\n"
+              f"bundle: {bundle_dir()}\n")
+    sys.stderr.write("\n" + banner)
+    try:
+        path = os.path.join(app_dir(), "puttquest-crash.log")
+        with open(path, "w") as fh:
+            fh.write(banner)
+        sys.stderr.write(f"\nSaved a copy to: {path}\n")
+    except OSError:
+        pass
+    if frozen() and os.name == "nt":
+        try:
+            input("\nPress ENTER to close this window...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Putt Quest")
     ap.add_argument("--run", choices=sorted(TOOLS),
@@ -222,10 +339,18 @@ def main() -> int:
                     help="start tracker + game without the menu")
     ap.add_argument("--game", action="store_true",
                     help="start the game only (keyboard test mode)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="print a diagnostic report and exit")
     args, rest = ap.parse_known_args()
 
-    prepare_workdir()
+    # unpacking a onefile bundle takes a while: say something immediately so
+    # a double-click never looks like nothing happened
+    print("Putt Quest — starting up...", flush=True)
+    work = prepare_workdir()
+    print(f"working directory: {work}", flush=True)
 
+    if args.selftest:
+        return selftest()
     if args.run:
         return run_tool(args.run, rest)
     if args.play:
@@ -236,4 +361,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as exc:          # noqa: BLE001 - last-resort net
+        report_crash(exc)
+        sys.exit(1)

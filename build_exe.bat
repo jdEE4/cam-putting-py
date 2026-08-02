@@ -20,7 +20,9 @@ echo Installing build + runtime dependencies ...
 "%PYTHON_BIN%" -m pip install --upgrade pip
 "%PYTHON_BIN%" -m pip install -r "%ROOT_DIR%requirements.txt"
 "%PYTHON_BIN%" -m pip install -r "%ROOT_DIR%requirements-game.txt"
-"%PYTHON_BIN%" -m pip install pyinstaller>=6.0
+rem NOTE: the version spec MUST be quoted - unquoted, cmd reads the ">" in
+rem "pyinstaller>=6.0" as a redirect and silently writes a file named "6.0"
+"%PYTHON_BIN%" -m pip install -r "%ROOT_DIR%requirements-build.txt"
 
 echo Cleaning previous build ...
 if exist "%ROOT_DIR%build\PuttQuest" rmdir /s /q "%ROOT_DIR%build\PuttQuest"
@@ -34,11 +36,24 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if not exist "%ROOT_DIR%dist\PuttQuest.exe" (
+    echo.
+    echo BUILD FAILED - dist\PuttQuest.exe was not produced.
+    exit /b 1
+)
+
 echo.
 echo ============================================
 echo   Done:  dist\PuttQuest.exe
 echo   Share that single file - no Python needed.
 echo ============================================
+echo.
+echo First launch unpacks the bundle and can take 10-30 seconds.
+echo Leave the console window open - the tracker prints ball speed there.
+echo.
+choice /C YN /M "Launch it now"
+if errorlevel 2 goto :eof
+start "" "%ROOT_DIR%dist\PuttQuest.exe"
 exit /b 0
 
 :make_venv
