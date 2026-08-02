@@ -6,6 +6,7 @@ import cv2
 import imutils
 import time
 import sys
+import platform
 import cvzone
 from ColorModuleExtended import ColorFinder
 import math
@@ -18,7 +19,7 @@ import shutil
 import threading
 import base64
 
-parser = ConfigParser()
+parser = ConfigParser(strict=False)
 CFG_FILE = 'config.ini'
 
 parser.read(CFG_FILE)
@@ -128,6 +129,17 @@ if parser.has_option('putting', 'previewstream'):
     previewstream=int(parser.get('putting', 'previewstream'))
 else:
     previewstream=1
+if parser.has_option('putting', 'backend'):
+    backendname=parser.get('putting', 'backend')
+else:
+    backendname='auto'
+if parser.has_option('putting', 'direction'):
+    direction=parser.get('putting', 'direction').strip().lower()
+else:
+    direction='lefttoright'
+# pdir folds the putt direction into every axis comparison: +1 = ball travels
+# left-to-right (default, legacy behavior), -1 = right-to-left
+pdir = -1 if direction == 'righttoleft' else 1
 if parser.has_option('putting', 'customhsv'):
     customhsv=ast.literal_eval(parser.get('putting', 'customhsv'))
     print(customhsv)
@@ -152,7 +164,10 @@ else:
 
 # Globals
 
-# Detection Gateway
+# Detection Gateway - placed just downstream of the start zone. For a
+# left-to-right putt that is to the RIGHT of sx2; for right-to-left it is to
+# the LEFT of sx1. recomputeGateway() keeps x1/x2/coord in sync with the
+# current start zone and direction.
 x1=sx2+10
 x2=x1+10
 
@@ -161,6 +176,21 @@ startcoord=[[sx1,y1],[sx2,y1],[sx1,y2],[sx2,y2]]
 
 #coord of polygon in frame::: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
 coord=[[x1,y1],[x2,y1],[x1,y2],[x2,y2]]
+
+def recomputeGateway():
+    global x1, x2
+    if pdir == 1:
+        x1 = sx2 + 10
+        x2 = x1 + 10
+    else:
+        x1 = sx1 - 10
+        x2 = x1 - 10
+    coord[0][0] = x1
+    coord[2][0] = x1
+    coord[1][0] = x2
+    coord[3][0] = x2
+
+recomputeGateway()
 
 golfballradius = 21.33; # in mm
 
@@ -359,22 +389,48 @@ if args.get("camera", False):
     webcamindex = args["camera"]
     print("Putting Cam activated at "+str(webcamindex))
 
+# Camera backend selection: 'auto' uses DirectShow on Windows (needed for
+# the driver settings dialog and reliable MJPG 60fps modes) and the OS
+# default everywhere else (AVFoundation on macOS). Overwrite in config.ini
+# with backend = dshow | msmf | avfoundation | v4l2 | any
+CAMERA_BACKENDS = {
+    'any': cv2.CAP_ANY,
+    'dshow': cv2.CAP_DSHOW,
+    'msmf': cv2.CAP_MSMF,
+    'avfoundation': cv2.CAP_AVFOUNDATION,
+    'v4l2': cv2.CAP_V4L2,
+}
+
+def resolveCameraBackend(name):
+    name = (name or 'auto').strip().lower()
+    if name in CAMERA_BACKENDS:
+        return CAMERA_BACKENDS[name]
+    if platform.system() == 'Windows':
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+
+def openCamera(index):
+    if mjpegenabled == 0:
+        return cv2.VideoCapture(index)
+    cap = cv2.VideoCapture(index, resolveCameraBackend(backendname))
+    # Request MJPG before resolution and FPS - many webcams only unlock
+    # their 60+ fps modes on the compressed stream and ignore FPS
+    # requests made while still in the uncompressed default format
+    mjpeg = cv2.VideoWriter_fourcc('M','J','P','G')
+    cap.set(cv2.CAP_PROP_FOURCC, mjpeg)
+    if height != 0 and width != 0:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    # Check if FPS is overwritten in config
+    if overwriteFPS != 0:
+        cap.set(cv2.CAP_PROP_FPS, overwriteFPS)
+        print("Overwrite FPS: "+str(cap.get(cv2.CAP_PROP_FPS)))
+    return cap
+
 # if a video path was not supplied, grab the reference
 # to the webcam
 if not args.get("video", False):
-    if mjpegenabled == 0:
-        vs = cv2.VideoCapture(webcamindex)
-    else:
-        vs = cv2.VideoCapture(webcamindex + cv2.CAP_DSHOW)
-        # Check if FPS is overwritten in config
-        if overwriteFPS != 0:
-            vs.set(cv2.CAP_PROP_FPS, overwriteFPS)
-            print("Overwrite FPS: "+str(vs.get(cv2.CAP_PROP_FPS)))
-        if height != 0 and width != 0:
-            vs.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            vs.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        mjpeg = cv2.VideoWriter_fourcc('M','J','P','G')
-        vs.set(cv2.CAP_PROP_FOURCC, mjpeg)
+    vs = openCamera(webcamindex)
     if vs.get(cv2.CAP_PROP_BACKEND) == -1:
         message = "No Camera could be opened at webcamera index "+str(webcamindex)+". If your webcam only supports compressed format MJPEG instead of YUY2 please set MJPEG option to 1"
     else:
@@ -463,22 +519,29 @@ if parser.has_option('putting', 'autofocus'):
 else:
     autofocus = vs.get(cv2.CAP_PROP_AUTOFOCUS)
 
-vs.set(cv2.CAP_PROP_SATURATION,saturation)
-vs.set(cv2.CAP_PROP_EXPOSURE,exposure)
-vs.set(cv2.CAP_PROP_AUTO_WB,autowb)
-vs.set(cv2.CAP_PROP_WHITE_BALANCE_BLUE_U,whiteBalanceBlue)
-vs.set(cv2.CAP_PROP_WHITE_BALANCE_RED_V,whiteBalanceRed)
-vs.set(cv2.CAP_PROP_BRIGHTNESS,brightness)
-vs.set(cv2.CAP_PROP_CONTRAST,contrast)
-vs.set(cv2.CAP_PROP_HUE,hue)
-vs.set(cv2.CAP_PROP_GAIN,gain)
-vs.set(cv2.CAP_PROP_MONOCHROME,monochrome)
-vs.set(cv2.CAP_PROP_SHARPNESS,sharpness)
-vs.set(cv2.CAP_PROP_AUTO_EXPOSURE,autoexposure)
-vs.set(cv2.CAP_PROP_GAMMA,gamma)
-vs.set(cv2.CAP_PROP_ZOOM,zoom)
-vs.set(cv2.CAP_PROP_FOCUS,focus)
-vs.set(cv2.CAP_PROP_AUTOFOCUS,autofocus)
+# Apply saved camera settings - a value of -1.0 means "not set" and is
+# skipped so the camera keeps its own default for that property
+def applyCameraProperty(prop, value):
+    if value is None or value == -1.0:
+        return
+    vs.set(prop, value)
+
+applyCameraProperty(cv2.CAP_PROP_SATURATION,saturation)
+applyCameraProperty(cv2.CAP_PROP_EXPOSURE,exposure)
+applyCameraProperty(cv2.CAP_PROP_AUTO_WB,autowb)
+applyCameraProperty(cv2.CAP_PROP_WHITE_BALANCE_BLUE_U,whiteBalanceBlue)
+applyCameraProperty(cv2.CAP_PROP_WHITE_BALANCE_RED_V,whiteBalanceRed)
+applyCameraProperty(cv2.CAP_PROP_BRIGHTNESS,brightness)
+applyCameraProperty(cv2.CAP_PROP_CONTRAST,contrast)
+applyCameraProperty(cv2.CAP_PROP_HUE,hue)
+applyCameraProperty(cv2.CAP_PROP_GAIN,gain)
+applyCameraProperty(cv2.CAP_PROP_MONOCHROME,monochrome)
+applyCameraProperty(cv2.CAP_PROP_SHARPNESS,sharpness)
+applyCameraProperty(cv2.CAP_PROP_AUTO_EXPOSURE,autoexposure)
+applyCameraProperty(cv2.CAP_PROP_GAMMA,gamma)
+applyCameraProperty(cv2.CAP_PROP_ZOOM,zoom)
+applyCameraProperty(cv2.CAP_PROP_FOCUS,focus)
+applyCameraProperty(cv2.CAP_PROP_AUTOFOCUS,autofocus)
 
 
 print("video_fps: "+str(video_fps))
@@ -496,19 +559,7 @@ if replaycam == 1:
 
 # replay is enabled start a 2nd video capture
 if replaycam == 1:
-    if mjpegenabled == 0:
-        vs2 = cv2.VideoCapture(replaycamindex)
-    else:
-        vs2 = cv2.VideoCapture(replaycamindex + cv2.CAP_DSHOW)
-        # Check if FPS is overwritten in config
-        if overwriteFPS != 0:
-            vs2.set(cv2.CAP_PROP_FPS, overwriteFPS)
-            print("Overwrite FPS: "+str(vs.get(cv2.CAP_PROP_FPS)))
-        if height != 0 and width != 0:
-            vs2.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            vs2.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        mjpeg = cv2.VideoWriter_fourcc('M','J','P','G')
-        vs2.set(cv2.CAP_PROP_FOURCC, mjpeg)
+    vs2 = openCamera(replaycamindex)
     if vs2.get(cv2.CAP_PROP_BACKEND) == -1:
         message = "No Camera could be opened at webcamera index "+str(replaycamindex)+". If your webcam only supports compressed format MJPEG instead of YUY2 please set MJPEG option to 1"
     else:
@@ -567,7 +618,9 @@ def setXStart(value):
     startcoord[2][0]=value
 
     global sx1
-    sx1=int(value)    
+    sx1=int(value)
+    # the gateway hangs off sx1 when the putt runs right-to-left
+    recomputeGateway()
     parser.set('putting', 'startx1', str(sx1))
     parser.write(open(CFG_FILE, "w"))
     pass
@@ -575,26 +628,25 @@ def setXStart(value):
 def setXEnd(value):
     print(value)
     startcoord[1][0]=value
-    startcoord[3][0]=value 
+    startcoord[3][0]=value
 
-    global x1
-    global x2
     global sx2
-     
-    # Detection Gateway
-    x1=int(value+10)
-    x2=int(x1+10)
-
-    #coord=[[x1,y1],[x2,y1],[x1,y2],[x2,y2]]
-    coord[0][0]=x1
-    coord[2][0]=x1
-    coord[1][0]=x2
-    coord[3][0]=x2
-
-    sx2=int(value)    
+    sx2=int(value)
+    # the gateway hangs off sx2 when the putt runs left-to-right
+    recomputeGateway()
     parser.set('putting', 'startx2', str(sx2))
     parser.write(open(CFG_FILE, "w"))
-    pass  
+    pass
+
+def setDirection(value):
+    global direction, pdir
+    direction = 'righttoleft' if int(value) == 1 else 'lefttoright'
+    pdir = -1 if direction == 'righttoleft' else 1
+    recomputeGateway()
+    parser.set('putting', 'direction', direction)
+    parser.write(open(CFG_FILE, "w"))
+    print("Putt direction: " + direction)
+    pass
 
 def setYStart(value):
     print(value)
@@ -688,11 +740,15 @@ def setDarkness(value):
 def GetAngle (p1, p2):
     x1, y1 = p1
     x2, y2 = p2
-    dX = x2 - x1
+    # fold the putt direction in so "forward" is always +x: for a right-to-left
+    # putt dX is negated, and (like a mirror / flipImage) the angle sign inverts
+    dX = (x2 - x1) * pdir
     dY = y2 - y1
     rads = math.atan2 (-dY, dX)
+    if pdir == -1:
+        rads = rads*-1
 
-    if flipImage == 1 and videofile == False:    	
+    if flipImage == 1 and videofile == False:
         rads = rads*-1
     return math.degrees (rads)
 
@@ -822,7 +878,7 @@ while True:
                     calObjectCount = 0
                     if colorcount == len(calibrationcolor):
                         vs.release()
-                        vs = cv2.VideoCapture(webcamindex)
+                        vs = openCamera(webcamindex)
                         videofile = False
                         #vs.set(cv2.CAP_PROP_FPS, 60)
                         ret, frame = vs.read()
@@ -914,7 +970,15 @@ while True:
 
 
 
-    mask = mask[y1:y2, sx1:640]
+    # Crop the search region to the side the putt actually travels: from the
+    # start zone rightward for L-R, or from the left edge to the start zone for
+    # R-L. maskxoff is added back to contour x so coords stay in frame space.
+    if pdir == 1:
+        maskxoff = sx1
+        mask = mask[y1:y2, sx1:mask.shape[1]]
+    else:
+        maskxoff = 0
+        mask = mask[y1:y2, 0:sx2]
 
     # Mask now comes from ColorFinder
     #mask = cv2.erode(mask, None, iterations=1)
@@ -970,7 +1034,7 @@ while True:
             radius = 0
             # Eliminate countours that are outside the y dimensions of the detection zone
             ((tempcenterx, tempcentery), tempradius) = cv2.minEnclosingCircle(cnts[index])
-            tempcenterx = tempcenterx + sx1
+            tempcenterx = tempcenterx + maskxoff
             tempcentery = tempcentery + y1
             if (tempcentery >= y1 and tempcentery <= y2):
                 rangefactor = 50
@@ -1060,7 +1124,7 @@ while True:
 
                         else:
 
-                            if (x >= coord[0][0] and entered == False and started == True):
+                            if (pdir*(x - coord[0][0]) >= 0 and entered == False and started == True):
                                 cv2.line(frame, (coord[0][0], coord[0][1]), (coord[2][0], coord[2][1]), (0, 255, 0),2)  # Changes line color to green
                                 tim1 = frameTime
                                 print("Ball Entered. Position: "+str(center))
@@ -1072,7 +1136,7 @@ while True:
                                 
                                 break
                             else:
-                                if ( x > coord[1][0] and entered == True and started == True):
+                                if ( pdir*(x - coord[1][0]) > 0 and entered == True and started == True):
                                     #calculate hla for circle and pts[0]
                                     previousHLA = (GetAngle((startCircle[0],startCircle[1]),pts[0])*-1)
                                     #calculate hla for circle and now
@@ -1088,7 +1152,7 @@ while True:
                                             similarHLA = False
                                     else:
                                         similarHLA = True
-                                    if ( x > (pts[0][0]+50)and similarHLA == True): # and (pow((y - (pts[0][1])), 2)) <= pow((y - (pts[1][1])), 2) 
+                                    if ( pdir*(x - pts[0][0]) > 50 and similarHLA == True): # and (pow((y - (pts[0][1])), 2)) <= pow((y - (pts[1][1])), 2)
                                         cv2.line(frame, (coord[1][0], coord[1][1]), (coord[3][0], coord[3][1]), (0, 255, 0),2)  # Changes line color to green
                                         tim2 = frameTime # Final time
                                         print("Ball Left. Position: "+str(center))
@@ -1115,7 +1179,13 @@ while True:
                                             tims.appendleft(frameTime)
                                             break
                                     else:
-                                        print("False Exit after the Ball")
+                                        # This branch fires every frame the
+                                        # ball is past the gateway but hasn't
+                                        # travelled >50 px yet — it used to
+                                        # print hundreds of lines per putt.
+                                        # Only log once per putt (in debug).
+                                        if args.get("debug", False):
+                                            print("False Exit after the Ball")
 
                                         # flip image on y-axis for view only
 
@@ -1239,10 +1309,12 @@ while True:
     if not lastShotSpeed == 0:
         cv2.line(frame,(lastShotStart),(lastShotEnd),(0, 255, 255),4,cv2.LINE_AA)      
     
+    # aim guide points downstream from the start zone edge the ball leaves from
+    aimx = sx2 if pdir == 1 else sx1
     if started:
-        cv2.line(frame,(sx2,startCircle[1]),(sx2+400,startCircle[1]),(255, 255, 255),4,cv2.LINE_AA)
+        cv2.line(frame,(aimx,startCircle[1]),(aimx+400*pdir,startCircle[1]),(255, 255, 255),4,cv2.LINE_AA)
     else:
-        cv2.line(frame,(sx2,int(y1+((y2-y1)/2))),(sx2+400,int(y1+((y2-y1)/2))),(255, 255, 255),4,cv2.LINE_AA) 
+        cv2.line(frame,(aimx,int(y1+((y2-y1)/2))),(aimx+400*pdir,int(y1+((y2-y1)/2))),(255, 255, 255),4,cv2.LINE_AA)
 
         # Mark Start Circle (green while armed and waiting for the putt,
         # red once the ball is moving)
@@ -1351,7 +1423,7 @@ while True:
     if previewstream == 1 and (frameTime - _lastPreviewTime) > 0.09:
         _lastPreviewTime = frameTime
         try:
-            thumb = resizeWithAspectRatio(frame, width=240)
+            thumb = resizeWithAspectRatio(frame, width=320)
             ok_enc, buf = cv2.imencode('.jpg', thumb,
                                        [int(cv2.IMWRITE_JPEG_QUALITY), 55])
             if ok_enc:
@@ -1362,7 +1434,8 @@ while True:
                                               "ready": ballReady,
                                               "lock": round(lockProgress, 3),
                                               "state": trackerState,
-                                              "fps": round(fps, 1)}
+                                              "fps": round(fps, 1),
+                                              "dir": "L>R" if pdir == 1 else "R>L"}
                     PREVIEW_LATEST["seq"] += 1
         except Exception as e:
             print("preview encode error:", e)
@@ -1479,13 +1552,15 @@ while True:
 
         if not a_key_pressed:
             cv2.namedWindow("Advanced Settings")
-            if mjpegenabled != 0:
-                vs.set(cv2.CAP_PROP_SETTINGS, 37)  
+            # the driver settings dialog is a DirectShow feature - Windows only
+            if mjpegenabled != 0 and platform.system() == "Windows":
+                vs.set(cv2.CAP_PROP_SETTINGS, 37)
             cv2.resizeWindow("Advanced Settings", 1000, 440)
             cv2.createTrackbar("X Start", "Advanced Settings", int(sx1), 640, setXStart)
             cv2.createTrackbar("X End", "Advanced Settings", int(sx2), 640, setXEnd)
             cv2.createTrackbar("Y Start", "Advanced Settings", int(y1), 460, setYStart)
             cv2.createTrackbar("Y End", "Advanced Settings", int(y2), 460, setYEnd)
+            cv2.createTrackbar("Putt Dir 0=L-R 1=R-L", "Advanced Settings", 1 if pdir == -1 else 0, 1, setDirection)
             cv2.createTrackbar("Radius", "Advanced Settings", int(ballradius), 50, setBallRadius)
             cv2.createTrackbar("Flip Image", "Advanced Settings", int(flipImage), 1, setFlip)
             cv2.createTrackbar("Flip View", "Advanced Settings", int(flipView), 1, setFlipView)

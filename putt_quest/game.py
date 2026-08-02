@@ -44,7 +44,14 @@ from .shot_listener import ShotListener
 
 FPS = 60
 PHYS_SUBSTEPS = 4
-MAX_PUTTS_PER_HOLE = 6          # mercy rule: pick up after this many
+DEFAULT_MERCY_LIMIT = 6         # pick up after this many putts (adjustable)
+MIN_MERCY_LIMIT = 3
+MAX_MERCY_LIMIT = 9
+MIN_STIMP = 6.0
+MAX_STIMP = 14.0
+STIMP_STEP = 0.5
+AIM_TRIM_STEP = 0.5
+MAX_AIM_TRIM = 10.0            # ± degrees you can bias camera-mode putts
 TRACKER_FRESH_SECS = 2.5       # status ping older than this = tracker gone
 PREVIEW_FRESH_SECS = 2.0       # webcam frame older than this = feed lost
 GUARD_LOW_FPS = FPS * 0.8      # sustained fps below this trips the guard
@@ -67,6 +74,7 @@ class HoleScore:
     hole: Hole
     putts: int = 0
     picked_up: bool = False
+    mulligans: int = 0
 
     @property
     def strokes(self) -> int:
@@ -119,6 +127,22 @@ class Game:
         # toggles
         self.debug = False
         self.show_minimap = True
+        self.camera_monitor = True   # live tracker view w/ zone confirmation
+
+        # tunables surfaced in the in-game settings menu
+        self.stimp_override: Optional[float] = None   # None = use course stimp
+        self.mercy_limit: int = DEFAULT_MERCY_LIMIT
+        # Aim trim: added to every real (camera) putt's HLA. Handy when the
+        # mat is too narrow to physically aim off-center. Persists across
+        # holes and sessions (mat orientation doesn't change hole-to-hole).
+        self.aim_trim_deg: float = 0.0
+        self.show_read: bool = False   # draw the pro-read curve on the green
+
+        # settings overlay state
+        self.settings_open = False
+        self.settings_idx = 0
+        # keyboard-shortcut help overlay (H / F1). Not persisted.
+        self.show_help = False
 
         # webcam preview decode cache
         self._pv_seq = -1
@@ -130,6 +154,12 @@ class Game:
         self.test_hla = 0.0
         self._preview: List[tuple] = []
         self._preview_key: Optional[Tuple] = None
+        # cache for the camera-mode "read" preview (independent of test mode)
+        self._read_path: List[tuple] = []
+        self._read_key: Optional[Tuple] = None
+        # snapshot of the ball state right before the most recent putt,
+        # so `U` (mulligan) can undo it. None = no undo available.
+        self._pre_shot: Optional[dict] = None
 
         self._load_settings()
         self.apply_preset(self.preset_idx, announce=False)
@@ -144,6 +174,27 @@ class Game:
                                          self.preset_idx))
             self.auto_scale = bool(data.get("auto_scale", True))
             self.show_minimap = bool(data.get("show_minimap", True))
+            self.camera_monitor = bool(data.get("camera_monitor", True))
+            so = data.get("stimp_override")
+            if so is not None:
+                try:
+                    self.stimp_override = max(MIN_STIMP,
+                                              min(MAX_STIMP, float(so)))
+                except (TypeError, ValueError):
+                    self.stimp_override = None
+            ml = data.get("mercy_limit", DEFAULT_MERCY_LIMIT)
+            try:
+                self.mercy_limit = max(MIN_MERCY_LIMIT,
+                                       min(MAX_MERCY_LIMIT, int(ml)))
+            except (TypeError, ValueError):
+                self.mercy_limit = DEFAULT_MERCY_LIMIT
+            try:
+                trim = float(data.get("aim_trim_deg", 0.0))
+                self.aim_trim_deg = max(-MAX_AIM_TRIM,
+                                        min(MAX_AIM_TRIM, trim))
+            except (TypeError, ValueError):
+                self.aim_trim_deg = 0.0
+            self.show_read = bool(data.get("show_read", False))
         except (OSError, ValueError, TypeError):
             pass
 
@@ -152,9 +203,33 @@ class Game:
             with open(SETTINGS_PATH, "w") as fh:
                 json.dump({"preset_idx": self.preset_idx,
                            "auto_scale": self.auto_scale,
-                           "show_minimap": self.show_minimap}, fh)
+                           "show_minimap": self.show_minimap,
+                           "camera_monitor": self.camera_monitor,
+                           "stimp_override": self.stimp_override,
+                           "mercy_limit": self.mercy_limit,
+                           "aim_trim_deg": self.aim_trim_deg,
+                           "show_read": self.show_read}, fh)
         except OSError:
             pass
+
+    # ---------------------------------------------------- tunables
+    def current_stimp(self) -> float:
+        """Effective green speed: manual override if set, else course value."""
+        if self.stimp_override is not None:
+            return self.stimp_override
+        if self.round is not None:
+            return self.round.course.stimp
+        return 10.0
+
+    def _rebuild_physics(self) -> None:
+        """Recreate the physics for the current hole (e.g. after a live
+        stimp change) without disturbing the ball position or trail."""
+        if self.round is None or self.physics is None:
+            return
+        h = self.round.hole
+        self.physics = GreenPhysics(h.distance_ft, h.break_pct,
+                                    h.slope_pct, self.current_stimp())
+        self._preview_key = None
 
     # ---------------------------------------------------- resolution
     def apply_preset(self, idx: int, announce: bool = True) -> None:
@@ -186,7 +261,7 @@ class Game:
         self.round.hole_idx = idx
         h = self.round.hole
         self.physics = GreenPhysics(h.distance_ft, h.break_pct,
-                                    h.slope_pct, self.round.course.stimp)
+                                    h.slope_pct, self.current_stimp())
         self.ball = Ball(0.0, 0.0)
         self.trail = []
         self.scene = GreenScene((gfx.INTERNAL_W, gfx.INTERNAL_H),
@@ -196,6 +271,7 @@ class Game:
         self.state = State.AWAIT_PUTT
         self.last_shot_info = ""
         self._preview_key = None
+        self._pre_shot = None       # fresh hole = nothing to undo
         self.set_banner(f"Hole {h.number} — {h.name}")
 
     def set_banner(self, msg: str, secs: float = 2.5) -> None:
@@ -207,12 +283,57 @@ class Game:
         if self.state != State.AWAIT_PUTT or not self.physics:
             return
         score = self.round.scores[self.round.hole_idx]
+        # snapshot for mulligan (undo) BEFORE mutating anything
+        self._pre_shot = {
+            "pos": (self.ball.x, self.ball.y),
+            "trail": list(self.trail),
+            "last_shot_info": self.last_shot_info,
+            "lipped": self.lipped,
+        }
         score.putts += 1
-        self.physics.launch(self.ball, speed_mph, hla_deg)
+        # Camera-mode putts pick up the aim trim; test mode uses the HLA
+        # supplied by the caller as-is so W/S/LEFT/RIGHT stay absolute.
+        applied_hla = hla_deg
+        if not self.test_mode and self.aim_trim_deg:
+            applied_hla = hla_deg + self.aim_trim_deg
+        self.physics.launch(self.ball, speed_mph, applied_hla)
         self.trail = [self.ball.pos]
         self.lipped = False
-        self.last_shot_info = f"{speed_mph:.1f} mph  HLA {hla_deg:+.1f} deg"
+        if applied_hla != hla_deg:
+            self.last_shot_info = (f"{speed_mph:.1f} mph  HLA {hla_deg:+.1f}"
+                                   f"° + trim {self.aim_trim_deg:+.1f}°")
+        else:
+            self.last_shot_info = f"{speed_mph:.1f} mph  HLA {hla_deg:+.1f} deg"
         self.state = State.ROLLING
+
+    def mulligan(self) -> bool:
+        """Undo the most recent putt: restore ball position, uncount the
+        stroke, stop the roll, and go back to AWAIT_PUTT. Only the last
+        shot can be undone (one snapshot deep). Returns True on success."""
+        if self._pre_shot is None or self.round is None:
+            self.set_banner("Nothing to mulligan", 1.5)
+            return False
+        if self.state not in (State.ROLLING, State.AWAIT_PUTT):
+            self.set_banner("Can't mulligan now", 1.5)
+            return False
+        snap = self._pre_shot
+        self._pre_shot = None       # one undo per shot
+        score = self.round.scores[self.round.hole_idx]
+        score.putts = max(0, score.putts - 1)
+        score.mulligans += 1
+        px, py = snap["pos"]
+        self.ball.x, self.ball.y = px, py
+        self.ball.vx = 0.0
+        self.ball.vy = 0.0
+        self.trail = list(snap["trail"])
+        self.last_shot_info = snap["last_shot_info"]
+        self.lipped = snap["lipped"]
+        self.state = State.AWAIT_PUTT
+        self.scene.position_camera(self.ball.pos)
+        self._preview_key = None
+        self._read_key = None
+        self.set_banner(f"Mulligan — putt {score.putts + 1} again", 2.0)
+        return True
 
     def finish_hole(self, holed: bool) -> None:
         score = self.round.scores[self.round.hole_idx]
@@ -222,7 +343,7 @@ class Game:
         label = {1: "ACE! One-putt!", 2: "Two putts — par.",
                  3: "Three putts."}.get(n, f"{n} putts.")
         if score.picked_up:
-            label = f"Picked up after {MAX_PUTTS_PER_HOLE} putts."
+            label = f"Picked up after {self.mercy_limit} putts."
         self.set_banner(label, 3.0)
         self.state = State.HOLE_DONE
 
@@ -259,7 +380,7 @@ class Game:
                     break
                 elif result == "stopped":
                     score = self.round.scores[self.round.hole_idx]
-                    if score.putts >= MAX_PUTTS_PER_HOLE:
+                    if score.putts >= self.mercy_limit:
                         self.finish_hole(holed=False)
                     else:
                         d_ft = math.hypot(
@@ -291,8 +412,35 @@ class Game:
 
     # ----------------------------------------------------------------
     def handle_key(self, key: int) -> None:
-        if key in (pygame.K_q, pygame.K_ESCAPE):
+        # Help overlay grabs input first: any key dismisses it so it can't
+        # trap the player. H / F1 / ? toggle it.
+        if self.show_help:
+            self.show_help = False
+            # let ESC/Q still quit even if help was open
+            if key == pygame.K_q:
+                self.quit()
+            return
+        if key in (pygame.K_h, pygame.K_F1) or (
+                key == pygame.K_SLASH
+                and (pygame.key.get_mods() & pygame.KMOD_SHIFT)):
+            self.show_help = True
+            return
+
+        # Settings overlay swallows everything except its own controls.
+        if self.settings_open:
+            self._handle_settings_key(key)
+            return
+
+        if key == pygame.K_ESCAPE:
+            # ESC closes menus, quits otherwise (Q always quits)
             self.quit()
+        if key == pygame.K_q:
+            self.quit()
+        if key in (pygame.K_o, pygame.K_TAB):
+            # open the in-game settings menu
+            self.settings_open = True
+            self.settings_idx = 0
+            return
         if key == pygame.K_t:
             self.test_mode = not self.test_mode
             self.set_banner("Test mode " +
@@ -301,6 +449,11 @@ class Game:
             self.debug = not self.debug
         if key == pygame.K_m:
             self.show_minimap = not self.show_minimap
+            self._save_settings()
+        if key == pygame.K_c:
+            self.camera_monitor = not self.camera_monitor
+            self.set_banner("Camera monitor " +
+                            ("ON" if self.camera_monitor else "OFF"))
             self._save_settings()
         if key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS, pygame.K_PLUS):
             if self.preset_idx < len(gfx.RES_PRESETS) - 1:
@@ -317,6 +470,11 @@ class Game:
             self._save_settings()
             self.set_banner("Auto-resolution guard "
                             + ("ON" if self.auto_scale else "OFF"))
+        if key == pygame.K_u:
+            # Mulligan: undo the last putt. Works during the roll or
+            # right after the ball settles.
+            self.mulligan()
+            return
 
         if self.state == State.MENU:
             if key == pygame.K_UP:
@@ -342,12 +500,312 @@ class Game:
                 self.test_hla -= 0.5
             elif key == pygame.K_RIGHT:
                 self.test_hla += 0.5
+        elif self.state == State.AWAIT_PUTT and not self.test_mode:
+            # Camera mode: arrows nudge the aim trim so putts can be
+            # biased left/right without physically re-aiming on a narrow mat.
+            if key == pygame.K_LEFT:
+                self._nudge_aim_trim(-AIM_TRIM_STEP)
+            elif key == pygame.K_RIGHT:
+                self._nudge_aim_trim(+AIM_TRIM_STEP)
+            elif key == pygame.K_p:
+                self.show_read = not self.show_read
+                self._save_settings()
+                self.set_banner("Read line "
+                                + ("ON" if self.show_read else "OFF"))
+            elif key == pygame.K_x:
+                if self.aim_trim_deg != 0.0:
+                    self.aim_trim_deg = 0.0
+                    self._read_key = None
+                    self._save_settings()
+                    self.set_banner("Aim trim reset to 0°")
         elif self.state == State.HOLE_DONE:
             if key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
                 self.next_hole()
         elif self.state == State.ROUND_DONE:
             if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.state = State.MENU
+
+    def _nudge_aim_trim(self, delta: float) -> None:
+        new = self.aim_trim_deg + delta
+        # snap to the step grid so repeated presses don't drift
+        new = round(new / AIM_TRIM_STEP) * AIM_TRIM_STEP
+        new = max(-MAX_AIM_TRIM, min(MAX_AIM_TRIM, new))
+        if new != self.aim_trim_deg:
+            self.aim_trim_deg = new
+            self._read_key = None      # invalidate cached read curve
+            self._save_settings()
+
+    # ---------------------------------------------- settings overlay
+    # Each row: (label, value_getter, kind, hint). `kind` drives editing:
+    #   "float"  = LEFT/RIGHT change by step (stimp)
+    #   "int"    = LEFT/RIGHT change by 1 (mercy limit)
+    #   "choice" = LEFT/RIGHT cycle choices (resolution)
+    #   "toggle" = ENTER / LEFT / RIGHT flip a bool
+    #   "action" = ENTER runs an action
+    def _settings_rows(self) -> List[Tuple[str, str, str, str]]:
+        rows: List[Tuple[str, str, str, str]] = []
+        stimp_val = f"{self.current_stimp():.1f} ft"
+        if self.stimp_override is not None:
+            stimp_val += "  (override)"
+        rows.append(("Green Speed (Stimp)", stimp_val, "float",
+                     f"LEFT/RIGHT ±{STIMP_STEP} — bigger = faster green"))
+        rows.append(("Mercy Limit", f"{self.mercy_limit} putts", "int",
+                     "auto pick-up after this many strokes"))
+        rows.append(("Aim Trim (camera mode)",
+                     f"{self.aim_trim_deg:+.1f}°", "float",
+                     "LEFT/RIGHT bias for real putts (narrow-mat helper)"))
+        rows.append(("Show Read Line",
+                     "ON" if self.show_read else "OFF", "toggle",
+                     "ghost curve of a well-struck putt at good pace"))
+        rows.append(("Resolution",
+                     gfx.RES_PRESETS[self.preset_idx][0], "choice",
+                     "internal render size (also on [ and ])"))
+        rows.append(("Auto FPS Guard",
+                     "ON" if self.auto_scale else "OFF", "toggle",
+                     "auto-drops preset if fps sags"))
+        rows.append(("Camera Monitor",
+                     "ON" if self.camera_monitor else "OFF", "toggle",
+                     "live webcam panel in the corner"))
+        rows.append(("Minimap",
+                     "ON" if self.show_minimap else "OFF", "toggle",
+                     "top-down mini view of the green"))
+        rows.append(("Debug Overlay",
+                     "ON" if self.debug else "OFF", "toggle",
+                     "fps + physics + shot log (also key D)"))
+        rows.append(("Reset stimp to course default",
+                     "" if self.stimp_override is None else "override active",
+                     "action", "restore the course's own green speed"))
+        rows.append(("Reset aim trim to 0°",
+                     "" if self.aim_trim_deg == 0.0 else "trim active",
+                     "action", "clear the manual aim bias (also key X)"))
+        rows.append(("Mulligan (undo last putt)",
+                     "available" if self._pre_shot is not None else "none",
+                     "action",
+                     "un-count the last stroke and re-putt (also key U)"))
+        rows.append(("Help / Keyboard Shortcuts", "H", "action",
+                     "pop up the full shortcut reference"))
+        rows.append(("Close (ESC / O)", "", "action",
+                     "back to the game"))
+        return rows
+
+    def _handle_settings_key(self, key: int) -> None:
+        rows = self._settings_rows()
+        n = len(rows)
+        if key in (pygame.K_ESCAPE, pygame.K_o, pygame.K_TAB):
+            self.settings_open = False
+            self._save_settings()
+            return
+        if key == pygame.K_UP:
+            self.settings_idx = (self.settings_idx - 1) % n
+            return
+        if key == pygame.K_DOWN:
+            self.settings_idx = (self.settings_idx + 1) % n
+            return
+        idx = self.settings_idx
+        label, _val, kind, _hint = rows[idx]
+        delta = 0
+        if key in (pygame.K_LEFT, pygame.K_a):
+            delta = -1
+        elif key in (pygame.K_RIGHT, pygame.K_d):
+            delta = 1
+        enter = key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE)
+
+        if label.startswith("Green Speed"):
+            if delta:
+                base = self.current_stimp()
+                new = base + STIMP_STEP * delta
+                # snap to STIMP_STEP grid
+                new = round(new / STIMP_STEP) * STIMP_STEP
+                new = max(MIN_STIMP, min(MAX_STIMP, new))
+                self.stimp_override = new
+                self._rebuild_physics()
+                self._save_settings()
+        elif label.startswith("Mercy"):
+            if delta:
+                self.mercy_limit = max(MIN_MERCY_LIMIT,
+                                       min(MAX_MERCY_LIMIT,
+                                           self.mercy_limit + delta))
+                self._save_settings()
+        elif label.startswith("Aim Trim"):
+            if delta:
+                self._nudge_aim_trim(AIM_TRIM_STEP * delta)
+        elif label.startswith("Show Read"):
+            if enter or delta:
+                self.show_read = not self.show_read
+                self._save_settings()
+        elif label.startswith("Resolution"):
+            if delta:
+                target = max(0, min(len(gfx.RES_PRESETS) - 1,
+                                    self.preset_idx + delta))
+                if target != self.preset_idx:
+                    self.apply_preset(target, announce=False)
+        elif label.startswith("Auto FPS Guard"):
+            if enter or delta:
+                self.auto_scale = not self.auto_scale
+                self._save_settings()
+        elif label.startswith("Camera Monitor"):
+            if enter or delta:
+                self.camera_monitor = not self.camera_monitor
+                self._save_settings()
+        elif label.startswith("Minimap"):
+            if enter or delta:
+                self.show_minimap = not self.show_minimap
+                self._save_settings()
+        elif label.startswith("Debug"):
+            if enter or delta:
+                self.debug = not self.debug
+        elif label.startswith("Reset stimp"):
+            if enter:
+                self.stimp_override = None
+                self._rebuild_physics()
+                self._save_settings()
+        elif label.startswith("Reset aim trim"):
+            if enter and self.aim_trim_deg != 0.0:
+                self.aim_trim_deg = 0.0
+                self._read_key = None
+                self._save_settings()
+        elif label.startswith("Mulligan"):
+            if enter:
+                self.settings_open = False
+                self.mulligan()
+        elif label.startswith("Help"):
+            if enter:
+                self.settings_open = False
+                self.show_help = True
+        elif label.startswith("Close"):
+            if enter:
+                self.settings_open = False
+                self._save_settings()
+
+    def draw_settings_overlay(self) -> None:
+        c = self.canvas
+        W, H = gfx.INTERNAL_W, gfx.INTERNAL_H
+        # dim the game behind the panel
+        dim = pygame.Surface((W, H), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 170))
+        c.blit(dim, (0, 0))
+
+        pw = gfx.sc(400)
+        ph = gfx.sc(330)
+        panel_rect = pygame.Rect(W // 2 - pw // 2, H // 2 - ph // 2, pw, ph)
+        gfx.panel(c, panel_rect, alpha=235)
+        pygame.draw.rect(c, gfx.ACCENT, panel_rect, 1,
+                         border_radius=gfx.sc(6))
+
+        gfx.text(c, "SETTINGS", panel_rect.centerx,
+                 panel_rect.y + gfx.sc(8), gfx.ACCENT, 26,
+                 center=True, shadow=True)
+
+        rows = self._settings_rows()
+        row_h = gfx.sc(22)
+        top = panel_rect.y + gfx.sc(40)
+        for i, (label, value, _kind, _hint) in enumerate(rows):
+            y = top + i * row_h
+            sel = (i == self.settings_idx)
+            if sel:
+                sel_rect = pygame.Rect(panel_rect.x + gfx.sc(6), y - gfx.sc(2),
+                                       pw - gfx.sc(12), row_h)
+                pygame.draw.rect(c, (40, 60, 44), sel_rect,
+                                 border_radius=gfx.sc(4))
+                pygame.draw.rect(c, gfx.ACCENT, sel_rect, 1,
+                                 border_radius=gfx.sc(4))
+            col = gfx.ACCENT if sel else gfx.HUD_TEXT
+            gfx.text(c, label, panel_rect.x + gfx.sc(16), y, col, 15)
+            if value:
+                vw = gfx.text_w(value, 15)
+                gfx.text(c, value, panel_rect.right - gfx.sc(16) - vw, y,
+                         col, 15)
+
+        # hint / help footer
+        _, _, _, hint = rows[self.settings_idx]
+        gfx.text(c, hint, panel_rect.centerx,
+                 panel_rect.bottom - gfx.sc(34), gfx.INFO, 13, center=True)
+        gfx.text(c, "UP/DOWN move · LEFT/RIGHT change · ENTER toggle · H help · ESC/O close",
+                 panel_rect.centerx, panel_rect.bottom - gfx.sc(18),
+                 gfx.HUD_DIM, 13, center=True)
+
+    # ---------------------------------------------- help overlay
+    def draw_help_overlay(self) -> None:
+        """Modal keyboard-shortcut reference. Any key dismisses it."""
+        c = self.canvas
+        W, H = gfx.INTERNAL_W, gfx.INTERNAL_H
+        dim = pygame.Surface((W, H), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 200))
+        c.blit(dim, (0, 0))
+
+        pw = gfx.sc(540)
+        ph = gfx.sc(430)
+        panel_rect = pygame.Rect(W // 2 - pw // 2, H // 2 - ph // 2, pw, ph)
+        gfx.panel(c, panel_rect, alpha=240)
+        pygame.draw.rect(c, gfx.ACCENT, panel_rect, 1,
+                         border_radius=gfx.sc(6))
+
+        gfx.text(c, "KEYBOARD SHORTCUTS", panel_rect.centerx,
+                 panel_rect.y + gfx.sc(10), gfx.ACCENT, 24,
+                 center=True, shadow=True)
+
+        # Two columns of grouped shortcuts. Each entry is (key, label).
+        sections = [
+            ("Menu", [
+                ("ENTER", "start selected course"),
+                ("UP/DOWN", "pick course"),
+                ("O / TAB", "settings"),
+                ("H / F1 / ?", "this help"),
+                ("Q / ESC", "quit"),
+            ]),
+            ("Gameplay (camera mode)", [
+                ("LEFT / RIGHT", "aim trim \u00b10.5\u00b0"),
+                ("P", "toggle read line"),
+                ("X", "reset aim trim to 0\u00b0"),
+                ("U", "mulligan (undo last putt)"),
+                ("O / TAB", "settings"),
+                ("H / F1", "help"),
+                ("R", "restart current course"),
+                ("ENTER", "next hole (after holed)"),
+            ]),
+            ("Test mode (T)", [
+                ("SPACE", "fire test putt"),
+                ("W / S", "\u00b10.25 mph speed"),
+                ("LEFT / RIGHT", "\u00b10.5\u00b0 test HLA"),
+                ("T", "leave test mode"),
+            ]),
+            ("Display / debug", [
+                ("D", "debug overlay"),
+                ("M", "minimap"),
+                ("C", "camera monitor"),
+                ("G", "auto-FPS guard"),
+                ("[ / ]", "resolution down / up"),
+            ]),
+        ]
+
+        col_w = (pw - gfx.sc(40)) // 2
+        col_x = [panel_rect.x + gfx.sc(20),
+                 panel_rect.x + gfx.sc(20) + col_w]
+        col_y = [panel_rect.y + gfx.sc(46),
+                 panel_rect.y + gfx.sc(46)]
+        for i, (title, items) in enumerate(sections):
+            col = i % 2
+            x = col_x[col]
+            y = col_y[col]
+            gfx.text(c, title, x, y, gfx.ACCENT, 15)
+            y += gfx.sc(18)
+            for k, lbl in items:
+                gfx.text(c, k, x, y, gfx.HUD_TEXT, 13)
+                gfx.text(c, lbl, x + gfx.sc(90), y, gfx.HUD_DIM, 13)
+                y += gfx.sc(15)
+            y += gfx.sc(6)
+            col_y[col] = y
+
+        # Ball tracker window has its own reference
+        note_y = max(col_y) + gfx.sc(4)
+        if note_y < panel_rect.bottom - gfx.sc(38):
+            gfx.text(c, "Tracker window: A advanced settings  \u00b7  "
+                        "D HSV color tuner  \u00b7  Q quit",
+                     panel_rect.centerx, note_y, gfx.INFO, 12, center=True)
+
+        gfx.text(c, "press any key to close",
+                 panel_rect.centerx, panel_rect.bottom - gfx.sc(20),
+                 gfx.HUD_DIM, 13, center=True)
 
     # ------------------------------------------------- tracker status
     def tracker_line(self) -> Tuple[str, tuple]:
@@ -395,6 +853,25 @@ class Game:
             self._preview_key = key
         return self._preview
 
+    def _read_preview(self) -> List[tuple]:
+        """Ghost path a well-struck putt would take at suggested pace with
+        the current aim trim. This is the 'pro read' overlay."""
+        if self.physics is None or self.round is None:
+            return []
+        h = self.round.hole
+        d_ft = math.hypot(self.ball.x - self.physics.hole_pos[0],
+                          self.ball.y - self.physics.hole_pos[1]) / FT_TO_M
+        pace = suggest_speed_mph(d_ft, h.slope_pct, self.current_stimp())
+        key = (round(pace, 3), round(self.aim_trim_deg, 2),
+               round(self.ball.x, 3), round(self.ball.y, 3),
+               round(self.current_stimp(), 2))
+        if key != self._read_key:
+            r = self.physics.simulate(self.ball.pos, pace,
+                                      self.aim_trim_deg, dt=1 / 120.0)
+            self._read_path = r.path[::4]
+            self._read_key = key
+        return self._read_path
+
     # ----------------------------------------------------------------
     def draw(self) -> None:
         if self.state == State.MENU:
@@ -406,6 +883,16 @@ class Game:
         self.draw_perf_readout()
         if self.debug:
             self.draw_debug()
+        # live tracker monitor: ball view + zone confirmation. Shown on the
+        # menu and during play so setup can be verified without leaving the game
+        if self.state != State.ROUND_DONE and (self.camera_monitor or self.debug):
+            self.draw_camera_panel()
+        # settings menu sits on top of everything else
+        if self.settings_open:
+            self.draw_settings_overlay()
+        # help overlay sits above even the settings menu
+        if self.show_help:
+            self.draw_help_overlay()
         gfx.blit_scaled(self.win, self.canvas)
         pygame.display.flip()
 
@@ -451,8 +938,8 @@ class Game:
         gfx.status_dot(c, foot.x + gfx.sc(14), foot.y + gfx.sc(29), col)
         gfx.text(c, msg, foot.x + gfx.sc(24), foot.y + gfx.sc(23), col, 15)
 
-        gfx.text(c, "ENTER play   T test   [ ] resolution   G guard   "
-                    "D debug   Q quit",
+        gfx.text(c, "ENTER play   O settings   H help   T test   C camera   "
+                    "[ ] resolution   D debug   Q quit",
                  W // 2, H - gfx.sc(18), gfx.HUD_DIM, 15, center=True)
 
     # ------------------------------------------------------------ hole
@@ -464,15 +951,21 @@ class Game:
         aim = None
         preview: List[tuple] = []
         if self.state == State.AWAIT_PUTT:
-            aim = (self.ball.pos, self.test_hla if self.test_mode else 0.0)
             if self.test_mode:
+                aim = (self.ball.pos, self.test_hla)
                 preview = self._test_preview()
+            else:
+                # camera mode: aim line follows the manual trim; optional
+                # "read" curve shows where a well-struck putt would go
+                aim = (self.ball.pos, self.aim_trim_deg)
+                if self.show_read:
+                    preview = self._read_preview()
         ball_pos = None if self.state == State.HOLE_DONE else self.ball.pos
         self.scene.draw(c, ball_pos, trail=self.trail[::3], t=self.time,
                         aim=aim, preview=preview)
 
-        # minimap (hidden when the debug camera panel occupies that corner)
-        if self.show_minimap and not self.debug:
+        # minimap (hidden when the camera panel occupies that corner)
+        if self.show_minimap and not (self.debug or self.camera_monitor):
             mm = pygame.Rect(W - gfx.sc(106), gfx.sc(8),
                              gfx.sc(98), gfx.sc(132))
             self.scene.draw_minimap(c, mm, ball_pos, self.trail[::3])
@@ -494,7 +987,10 @@ class Game:
                      head.x + gfx.sc(10), head.y + gfx.sc(42), gfx.INFO, 15)
 
         # score chip (drop below the minimap when it's shown)
-        chip_y = gfx.sc(146) if (self.show_minimap and not self.debug) else gfx.sc(8)
+        panel_corner = self.debug or self.camera_monitor
+        chip_y = gfx.sc(146) if (self.show_minimap and not panel_corner) else gfx.sc(8)
+        if panel_corner:
+            chip_y = gfx.sc(212)     # drop below the camera monitor
         chip = pygame.Rect(W - gfx.sc(106), chip_y, gfx.sc(98), gfx.sc(40))
         gfx.panel(c, chip)
         gfx.text(c, f"putt {score.putts + (self.state == State.AWAIT_PUTT)}",
@@ -522,8 +1018,15 @@ class Game:
             gfx.text(c, f"rolling...  {mph:.1f} mph", bar.x + gfx.sc(10),
                      bar.y + gfx.sc(5), gfx.HUD_TEXT, 15)
         else:
-            gfx.text(c, "waiting for putt from camera", bar.x + gfx.sc(10),
-                     bar.y + gfx.sc(5), gfx.HUD_DIM, 15)
+            trim_bit = ""
+            if self.aim_trim_deg:
+                trim_bit = f"   aim trim {self.aim_trim_deg:+.1f}°"
+            read_bit = "   read ON" if self.show_read else ""
+            gfx.text(c, "waiting for putt from camera   "
+                        "LEFT/RIGHT aim   P read   X reset   U mulligan   H help"
+                        + trim_bit + read_bit,
+                     bar.x + gfx.sc(10), bar.y + gfx.sc(5),
+                     gfx.ACCENT if self.aim_trim_deg else gfx.HUD_DIM, 15)
         if self.last_shot_info:
             gfx.text(c, self.last_shot_info,
                      bar.right - gfx.sc(10) - gfx.text_w(self.last_shot_info, 15),
@@ -601,7 +1104,8 @@ class Game:
                      gfx.HUD_DIM, 15, center=True)
             col = (gfx.GOOD if s.strokes == 1 else
                    gfx.HUD_TEXT if s.strokes <= s.hole.par else gfx.BAD)
-            label = f"{s.strokes}" + ("*" if s.picked_up else "")
+            label = f"{s.strokes}" + ("*" if s.picked_up else "") + (
+                "\u2020" if s.mulligans else "")
             gfx.text(c, label, box.centerx, box.y + gfx.sc(24), col, 28,
                      center=True)
             gfx.text(c, f"{s.hole.distance_ft:.0f}ft", box.centerx,
@@ -615,12 +1119,14 @@ class Game:
         if any(s.picked_up for s in r.scores):
             gfx.text(c, "* picked up", W // 2, gfx.sc(228), gfx.HUD_DIM, 14,
                      center=True)
+        if any(s.mulligans for s in r.scores):
+            gfx.text(c, "\u2020 mulligan used", W // 2, gfx.sc(244),
+                     gfx.HUD_DIM, 14, center=True)
         gfx.text(c, "ENTER menu    R replay course", W // 2, H - gfx.sc(34),
                  gfx.HUD_DIM, 16, center=True)
 
     # ----------------------------------------------------------- debug
     def draw_debug(self) -> None:
-        self.draw_camera_panel()
         c = self.canvas
         rect = pygame.Rect(gfx.sc(6), gfx.sc(76), gfx.sc(300), gfx.sc(190))
         gfx.panel(c, rect, alpha=215)
@@ -660,16 +1166,18 @@ class Game:
                  f"{msg[:38]}", gfx.INFO)
 
     def draw_camera_panel(self) -> None:
-        """Live webcam thumbnail with a bold ready/lock state border."""
+        """Live tracker monitor: the annotated camera view (start zone,
+        gateway and ball circle are drawn by ball_tracking.py) plus a bold
+        ready/lock border, putt direction and camera fps."""
         c = self.canvas
         W = gfx.INTERNAL_W
-        pw, ph = gfx.sc(176), gfx.sc(120)
+        pw, ph = gfx.sc(236), gfx.sc(200)
         rect = pygame.Rect(W - pw - gfx.sc(6), gfx.sc(6), pw, ph)
         gfx.panel(c, rect, alpha=210)
         surf, meta, age = self._get_preview_surface()
 
         img_area = pygame.Rect(rect.x + gfx.sc(4), rect.y + gfx.sc(4),
-                               rect.w - gfx.sc(8), rect.h - gfx.sc(22))
+                               rect.w - gfx.sc(8), rect.h - gfx.sc(40))
         if surf is not None and age is not None and age < PREVIEW_FRESH_SECS:
             iw, ih = surf.get_size()
             scale = min(img_area.w / iw, img_area.h / ih)
@@ -695,9 +1203,13 @@ class Game:
             pygame.draw.rect(c, bcol, (ix, iy, dw, dh), gfx.sc(3))
             lw = gfx.text_w(blabel, 15)
             gfx.status_dot(c, rect.centerx - lw // 2 - gfx.sc(8),
-                           rect.bottom - gfx.sc(10), bcol, r=4)
+                           rect.bottom - gfx.sc(30), bcol, r=4)
             gfx.text(c, blabel, rect.centerx + gfx.sc(4),
-                     rect.bottom - gfx.sc(16), bcol, 15, center=True)
+                     rect.bottom - gfx.sc(36), bcol, 15, center=True)
+            info = "putt dir %s   ·   cam %s fps" % (
+                meta.get("dir", "?"), meta.get("fps", "?"))
+            gfx.text(c, info, rect.centerx, rect.bottom - gfx.sc(18),
+                     gfx.HUD_DIM, 13, center=True)
         else:
             gfx.text(c, "CAMERA", rect.centerx, img_area.y + gfx.sc(6),
                      gfx.HUD_DIM, 15, center=True)

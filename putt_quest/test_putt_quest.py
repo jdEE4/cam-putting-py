@@ -156,3 +156,33 @@ def test_listener_status_pings_do_not_become_shots():
         assert st["ballradius"] == 14
     finally:
         lis.stop()
+
+
+def test_mulligan_undoes_last_putt():
+    """Mulligan must uncount the stroke, restore position, and refuse
+    when there's nothing to undo."""
+    import os
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    from putt_quest.game import Game, State
+    from putt_quest.courses import COURSES
+    g = Game()
+    g.start_round(COURSES[0])
+    # nothing to undo yet
+    assert g.mulligan() is False
+    assert g.round.scores[0].putts == 0
+
+    # fire a putt, then mulligan while it rolls
+    g.take_shot(4.0, 0.0)
+    assert g.state == State.ROLLING
+    assert g.round.scores[0].putts == 1
+    ok = g.mulligan()
+    assert ok is True
+    assert g.state == State.AWAIT_PUTT
+    assert g.round.scores[0].putts == 0
+    assert g.round.scores[0].mulligans == 1
+    assert g.ball.vx == 0.0 and g.ball.vy == 0.0
+
+    # only one undo per shot
+    assert g.mulligan() is False
+    assert g.round.scores[0].putts == 0
+
