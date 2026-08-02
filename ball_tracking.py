@@ -1179,7 +1179,13 @@ while True:
                                             tims.appendleft(frameTime)
                                             break
                                     else:
-                                        print("False Exit after the Ball")
+                                        # This branch fires every frame the
+                                        # ball is past the gateway but hasn't
+                                        # travelled >50 px yet — it used to
+                                        # print hundreds of lines per putt.
+                                        # Only log once per putt (in debug).
+                                        if args.get("debug", False):
+                                            print("False Exit after the Ball")
 
                                         # flip image on y-axis for view only
 
