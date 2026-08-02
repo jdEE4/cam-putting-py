@@ -225,3 +225,31 @@ line lands on target. Reset with `X` any time.
 
 **Tracker log full of `False Exit after the Ball`.** Fixed — that spam
 now only appears when the tracker is launched with `-d` (debug).
+
+## Mini Golf Mode
+
+Two obstacle courses appear on the course menu alongside Classic 9 and
+Links Test:
+
+- **Windmill Gardens** (stimp 9) — classic crazy golf: railed fairways,
+  bank shots, a rotating windmill, bumper posts, sand traps, a mail-slot
+  dogleg and a keyhole gate.
+- **Portal Park** (stimp 10.5) — physics-park golf: teleporter rings,
+  conveyor boost pads, a pinball field, a four-armed windmill, and the
+  everything-at-once finale "Event Horizon".
+
+How the obstacles behave:
+
+| Feature | Behavior |
+| --- | --- |
+| Wooden rails | ball banks off them (lively, ~86% speed kept) |
+| Red posts | pinball-style bounce |
+| Windmill | rotating blades swat the ball; roll under between sweeps |
+| Portal rings | entering either ring teleports the ball out of the other, keeping its direction |
+| Sand | heavy friction — the ball dies quickly |
+| Boost pads | push the ball along the printed chevrons |
+
+Every hole is fully enclosed (the ball cannot leave) and every hole is
+verified ace-able with a realistic putt (max ~6.4 mph, within about 24
+degrees of the cup line) — the test suite brute-forces each one. Cups in
+mini golf mode are wider than regulation, like the real thing.

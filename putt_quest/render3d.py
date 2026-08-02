@@ -56,6 +56,19 @@ AIM = (255, 216, 90)
 PREVIEW = (140, 235, 255)
 TRAIL = (235, 244, 252)
 ARROW = (255, 255, 255)
+# mini golf palette
+RAIL_TOP = (196, 148, 92)
+RAIL_SIDE = (150, 106, 62)
+RAIL_DARK = (110, 76, 44)
+BUMPER_TOP = (232, 78, 78)
+BUMPER_SIDE = (176, 52, 52)
+SAND_COL = (206, 186, 132)
+SAND_DARK = (178, 158, 108)
+BOOST_COL = (120, 210, 255)
+PORTAL_A = (120, 235, 255)
+PORTAL_B = (255, 140, 245)
+MILL_BLADE = (238, 238, 230)
+MILL_EDGE = (150, 60, 50)
 
 
 def _clamp(v, lo, hi):
@@ -119,15 +132,21 @@ class GreenScene:
     rest (it re-renders the cached background); call draw() every frame."""
 
     def __init__(self, size: Tuple[int, int], hole_dist_m: float,
-                 break_pct: float, slope_pct: float):
+                 break_pct: float, slope_pct: float, features=None):
         self.size = size
         self.dist = hole_dist_m
         self.break_pct = break_pct
         self.slope_pct = slope_pct
-        self.cup = (0.0, hole_dist_m)
+        self.features = features
+        cup_x = features.cup_x if features is not None else 0.0
+        self.cup = (cup_x, hole_dist_m)
+        self.cup_visual_r = CUP_VISUAL_R * (features.cup_scale
+                                            if features is not None else 1.0)
         self.cam = Camera3D(size)
         self.bg: Optional[pygame.Surface] = None
         self.green_half_w = max(2.2, 0.26 * hole_dist_m + 1.0)
+        if features is not None and features.half_w > 0:
+            self.green_half_w = features.half_w
         self.green_len_pad = 2.2
         self._rnd = random.Random(int(hole_dist_m * 100) ^ 1234)
 
@@ -179,8 +198,10 @@ class GreenScene:
         bg = pygame.Surface(self.size)
         self._draw_sky(bg)
         self._draw_ground(bg)
+        self._draw_flat_features(bg)      # sand / boost / portal pads
         self._draw_slope_arrows(bg)
         self._draw_cup(bg)
+        self._draw_solid_features(bg)     # walls + bumpers, depth sorted
         self.bg = bg
 
     def _horizon_y(self) -> int:
@@ -291,6 +312,169 @@ class GreenScene:
                                       ya + sy * dys / 3,
                                       ya + (sy + 1) * dys / 3, n)
 
+    # ------------------------------------------------ mini golf features
+    def _proj_ring(self, cx: float, cy: float, r: float, lift: float,
+                   n: int = 18):
+        pts = []
+        for i in range(n):
+            a = 2 * math.pi * i / n
+            p = self.cam.project(self.surface_pt(cx + r * math.cos(a),
+                                                 cy + r * math.sin(a), lift))
+            if p is None:
+                return None
+            pts.append((p[0], p[1]))
+        return pts
+
+    def _draw_flat_features(self, bg: pygame.Surface) -> None:
+        f = self.features
+        if f is None:
+            return
+        for s in f.sand:
+            ring = self._proj_ring(s.x, s.y, s.r, 0.006)
+            if ring:
+                pygame.draw.polygon(bg, SAND_COL, ring)
+                pygame.draw.aalines(bg, SAND_DARK, True, ring)
+        for b in f.boosts:
+            quad = []
+            for (x, y) in ((b.x0, b.y0), (b.x1, b.y0),
+                           (b.x1, b.y1), (b.x0, b.y1)):
+                p = self.cam.project(self.surface_pt(x, y, 0.006))
+                if p is None:
+                    quad = []
+                    break
+                quad.append((p[0], p[1]))
+            if not quad:
+                continue
+            pad = pygame.Surface(self.size, pygame.SRCALPHA)
+            pygame.draw.polygon(pad, (*BOOST_COL, 60), quad)
+            bg.blit(pad, (0, 0))
+            # chevrons along the push direction
+            mag = math.hypot(b.ax, b.ay) or 1.0
+            ux, uy = b.ax / mag, b.ay / mag
+            cx0, cy0 = (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2
+            for k in (-1, 0, 1):
+                base = (cx0 + ux * 0.3 * k, cy0 + uy * 0.3 * k)
+                tip = self.cam.project(self.surface_pt(
+                    base[0] + ux * 0.16, base[1] + uy * 0.16, 0.01))
+                for side in (-1, 1):
+                    wing = self.cam.project(self.surface_pt(
+                        base[0] - uy * 0.10 * side,
+                        base[1] + ux * 0.10 * side, 0.01))
+                    if tip and wing:
+                        pygame.draw.line(bg, BOOST_COL, wing[:2], tip[:2], 2)
+        for p in f.portals:
+            for (px, py, col) in ((p.ax, p.ay, PORTAL_A),
+                                  (p.bx, p.by, PORTAL_B)):
+                ring = self._proj_ring(px, py, p.r, 0.008)
+                inner = self._proj_ring(px, py, p.r * 0.55, 0.008)
+                if ring:
+                    pygame.draw.polygon(bg, (24, 26, 40), ring)
+                    pygame.draw.aalines(bg, col, True, ring)
+                if inner:
+                    pygame.draw.aalines(bg, col, True, inner)
+
+    def _wall_prism(self, x1, y1, x2, y2, h, half_t=0.03):
+        """8 corners of a rail box (4 base, 4 top), or None off-camera."""
+        dx, dy = x2 - x1, y2 - y1
+        L = math.hypot(dx, dy) or 1e-6
+        px, py = -dy / L * half_t, dx / L * half_t
+        foot = ((x1 + px, y1 + py), (x2 + px, y2 + py),
+                (x2 - px, y2 - py), (x1 - px, y1 - py))
+        base, top = [], []
+        for (x, y) in foot:
+            b = self.cam.project(self.surface_pt(x, y, 0.0))
+            tp = self.cam.project(self.surface_pt(x, y, h))
+            if b is None or tp is None:
+                return None
+            base.append((b[0], b[1]))
+            top.append((tp[0], tp[1]))
+        return base, top
+
+    def _draw_solid_features(self, bg: pygame.Surface) -> None:
+        f = self.features
+        if f is None:
+            return
+        ex, ey = self.cam.eye[0], self.cam.eye[1]
+        solids = []
+        for w in f.walls:
+            mx, my = (w.x1 + w.x2) / 2, (w.y1 + w.y2) / 2
+            solids.append((math.hypot(mx - ex, my - ey), "wall", w))
+        for b in f.bumpers:
+            solids.append((math.hypot(b.x - ex, b.y - ey), "bumper", b))
+        for m in f.windmills:
+            # static hub post lives in the background; blades are dynamic
+            solids.append((math.hypot(m.x - ex, m.y - ey), "hub", m))
+        for _, kind, ob in sorted(solids, key=lambda s: -s[0]):
+            if kind == "wall":
+                prism = self._wall_prism(ob.x1, ob.y1, ob.x2, ob.y2, ob.h)
+                if prism is None:
+                    continue
+                base, top = prism
+                for i in range(4):           # side skirts
+                    j = (i + 1) % 4
+                    pygame.draw.polygon(
+                        bg, RAIL_SIDE if i % 2 == 0 else RAIL_DARK,
+                        [base[i], base[j], top[j], top[i]])
+                pygame.draw.polygon(bg, RAIL_TOP, top)
+                pygame.draw.aalines(bg, RAIL_DARK, True, top)
+            elif kind == "bumper":
+                lo = self._proj_ring(ob.x, ob.y, ob.r, 0.0, 14)
+                hi = self._proj_ring(ob.x, ob.y, ob.r, 0.10, 14)
+                if lo and hi:
+                    pygame.draw.polygon(bg, BUMPER_SIDE,
+                                        lo[:8] + list(reversed(hi[:8])))
+                    pygame.draw.polygon(bg, BUMPER_TOP, hi)
+                    pygame.draw.aalines(bg, BUMPER_SIDE, True, hi)
+            else:  # windmill hub
+                lo = self._proj_ring(ob.x, ob.y, 0.05, 0.0, 10)
+                hi = self._proj_ring(ob.x, ob.y, 0.05, 0.16, 10)
+                if lo and hi:
+                    pygame.draw.polygon(bg, RAIL_DARK,
+                                        lo[:6] + list(reversed(hi[:6])))
+                    pygame.draw.polygon(bg, MILL_EDGE, hi)
+
+    def _draw_windmills(self, canvas: pygame.Surface, t: float) -> None:
+        f = self.features
+        if f is None or not f.windmills:
+            return
+        for m in f.windmills:
+            for k in range(m.blades):
+                ang = m.phase + m.omega * t + k * 2.0 * math.pi / m.blades
+                ca, sa = math.cos(ang), math.sin(ang)
+                px, py = -sa * 0.045, ca * 0.045   # blade half width
+                quad = []
+                for (x, y) in ((m.x + px, m.y + py),
+                               (m.x + m.length * ca + px,
+                                m.y + m.length * sa + py),
+                               (m.x + m.length * ca - px,
+                                m.y + m.length * sa - py),
+                               (m.x - px, m.y - py)):
+                    p = self.cam.project(self.surface_pt(x, y, 0.055))
+                    if p is None:
+                        quad = []
+                        break
+                    quad.append((p[0], p[1]))
+                if quad:
+                    pygame.draw.polygon(canvas, MILL_BLADE, quad)
+                    pygame.draw.aalines(canvas, MILL_EDGE, True, quad)
+                tip = self.cam.project(self.surface_pt(
+                    m.x + m.length * ca, m.y + m.length * sa, 0.06))
+                if tip:
+                    pygame.draw.circle(canvas, MILL_EDGE,
+                                       (int(tip[0]), int(tip[1])), 3)
+
+    def _draw_portal_glow(self, canvas: pygame.Surface, t: float) -> None:
+        f = self.features
+        if f is None or not f.portals:
+            return
+        pulse = 0.72 + 0.28 * math.sin(t * 3.2)
+        for p in f.portals:
+            for (px, py, col) in ((p.ax, p.ay, PORTAL_A),
+                                  (p.bx, p.by, PORTAL_B)):
+                ring = self._proj_ring(px, py, p.r * pulse, 0.012)
+                if ring:
+                    pygame.draw.aalines(canvas, col, True, ring)
+
     def _draw_slope_arrows(self, bg: pygame.Surface) -> None:
         mag = math.hypot(self.break_pct, self.slope_pct)
         if mag < 0.05:
@@ -324,8 +508,8 @@ class GreenScene:
         rim, hole = [], []
         for i in range(20):
             a = 2 * math.pi * i / 20
-            x = cx + CUP_VISUAL_R * math.cos(a)
-            y = cy + CUP_VISUAL_R * math.sin(a)
+            x = cx + self.cup_visual_r * math.cos(a)
+            y = cy + self.cup_visual_r * math.sin(a)
             p = self.cam.project(self.surface_pt(x, y, 0.004))
             if p is None:
                 return
@@ -349,6 +533,8 @@ class GreenScene:
             self._draw_path(canvas, preview, PREVIEW, dashed=True)
         if len(trail) > 1:
             self._draw_path(canvas, trail, TRAIL)
+        self._draw_portal_glow(canvas, t)
+        self._draw_windmills(canvas, t)
         self._draw_flag(canvas, t)
         if ball_pos is not None:
             self._draw_ball(canvas, ball_pos)
@@ -468,6 +654,37 @@ class GreenScene:
                 pygame.draw.line(panel, col,
                                  (rect.w / 2 - hw * s, py),
                                  (rect.w / 2 + hw * s, py))
+        # mini golf features on the minimap
+        if self.features is not None:
+            for sz in self.features.sand:
+                pygame.draw.circle(panel, SAND_COL, to_px(sz.x, sz.y),
+                                   max(2, int(sz.r * s)))
+            for b in self.features.boosts:
+                x0, y0 = to_px(b.x0, b.y1)
+                x1, y1 = to_px(b.x1, b.y0)
+                zone = pygame.Surface((max(1, x1 - x0), max(1, y1 - y0)),
+                                      pygame.SRCALPHA)
+                zone.fill((*BOOST_COL, 70))
+                panel.blit(zone, (x0, y0))
+            for p in self.features.portals:
+                pygame.draw.circle(panel, PORTAL_A, to_px(p.ax, p.ay),
+                                   max(2, int(p.r * s)), 1)
+                pygame.draw.circle(panel, PORTAL_B, to_px(p.bx, p.by),
+                                   max(2, int(p.r * s)), 1)
+            for w in self.features.walls:
+                pygame.draw.line(panel, RAIL_TOP, to_px(w.x1, w.y1),
+                                 to_px(w.x2, w.y2), 2)
+            for b in self.features.bumpers:
+                pygame.draw.circle(panel, BUMPER_TOP, to_px(b.x, b.y),
+                                   max(2, int(b.r * s)))
+            for m in self.features.windmills:
+                mc = to_px(m.x, m.y)
+                L = max(3, int(m.length * s))
+                pygame.draw.line(panel, MILL_BLADE,
+                                 (mc[0] - L, mc[1]), (mc[0] + L, mc[1]), 1)
+                pygame.draw.line(panel, MILL_BLADE,
+                                 (mc[0], mc[1] - L), (mc[0], mc[1] + L), 1)
+                pygame.draw.circle(panel, MILL_EDGE, mc, 2)
         cp = to_px(*self.cup)
         pygame.draw.circle(panel, CUP_DARK, cp, max(2, int(s * CUP_VISUAL_R) + 1))
         pygame.draw.circle(panel, FLAG_RED, (cp[0] + 2, cp[1] - 3), 2)

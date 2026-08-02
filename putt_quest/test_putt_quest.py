@@ -186,3 +186,120 @@ def test_mulligan_undoes_last_putt():
     assert g.mulligan() is False
     assert g.round.scores[0].putts == 0
 
+
+
+# ---------------------------------------------------------- mini golf
+import math
+
+from putt_quest.courses import COURSES, PORTAL_PARK, WINDMILL_GARDENS
+from putt_quest.minigolf import (Boost, HoleFeatures, Portal, Sand, Wall,
+                                 Windmill, rails)
+
+
+def test_minigolf_courses_registered():
+    names = [c.name for c in COURSES]
+    assert "Windmill Gardens" in names and "Portal Park" in names
+    for course in (WINDMILL_GARDENS, PORTAL_PARK):
+        assert len(course.holes) == 9
+        for h in course.holes:
+            assert h.features is not None
+            assert h.features.walls, f"{h.name} must be fully railed"
+
+
+def test_wall_bounces_ball_back():
+    feats = HoleFeatures(walls=(Wall(-1.0, 1.0, 1.0, 1.0),))
+    g = GreenPhysics(10.0, 0.0, 0.0, 10.0, features=feats)
+    r = g.simulate((0, 0), 4.0, 0.0)
+    assert not r.holed
+    # ball hit the wall at y=1.0 and came back: never got past it
+    assert max(y for _, y in r.path) < 1.05
+    assert r.final_pos[1] < 1.0
+
+
+def test_bank_shot_reflects_angle():
+    # fire at 45 degrees into the right rail; ball must come back leftward
+    feats = HoleFeatures(walls=(Wall(0.5, -1.0, 0.5, 4.0),))
+    g = GreenPhysics(10.0, 0.0, 0.0, 10.0, features=feats)
+    r = g.simulate((0, 0), 5.0, 40.0)
+    assert min(x for x, _ in r.path) < -0.1   # crossed back over the line
+    assert max(x for x, _ in r.path) <= 0.55  # never passed the rail
+
+
+def test_portal_teleports_ball():
+    feats = HoleFeatures(portals=(Portal(0.0, 1.0, 1.5, 2.5),))
+    g = GreenPhysics(12.0, 0.0, 0.0, 10.0, features=feats)
+    r = g.simulate((0, 0), 3.0, 0.0)
+    # the path must jump: some point lands near the B ring exit
+    assert any(math.hypot(x - 1.5, y - 2.5) < 0.6 for x, y in r.path)
+
+
+def test_sand_shortens_rollout():
+    g_clean = GreenPhysics(20.0, 0.0, 0.0, 10.0)
+    sandy = HoleFeatures(sand=(Sand(0.0, 1.5, 0.8, friction=4.0),))
+    g_sand = GreenPhysics(20.0, 0.0, 0.0, 10.0, features=sandy)
+    clean = g_clean.simulate((0, 0), 5.0, 0.0).rollout_m
+    sand = g_sand.simulate((0, 0), 5.0, 0.0).rollout_m
+    assert sand < clean * 0.8
+
+
+def test_boost_lengthens_rollout():
+    boosted = HoleFeatures(boosts=(Boost(-1.0, 0.5, 1.0, 2.0, ay=2.0),))
+    g_boost = GreenPhysics(20.0, 0.0, 0.0, 10.0, features=boosted)
+    g_clean = GreenPhysics(20.0, 0.0, 0.0, 10.0)
+    assert (g_boost.simulate((0, 0), 3.0, 0.0).rollout_m
+            > g_clean.simulate((0, 0), 3.0, 0.0).rollout_m)
+
+
+def test_static_windmill_blade_blocks():
+    # omega=0 with phase 90deg parks one blade vertically across the line
+    feats = HoleFeatures(windmills=(
+        Windmill(0.0, 1.5, blades=2, length=0.6, omega=0.0,
+                 phase=math.pi / 2),))
+    g = GreenPhysics(10.0, 0.0, 0.0, 10.0, features=feats)
+    r = g.simulate((0, 0), 3.0, 0.0)
+    assert not r.holed
+    assert r.final_pos[1] < 1.5
+
+
+def test_offset_cup_dogleg_reachable():
+    # The Mail Slot: cup at (1.0, 3.05m); the slot on the diagonal must
+    # let a realistic putt drop
+    hole = WINDMILL_GARDENS.holes[1]
+    g = GreenPhysics(hole.distance_ft, hole.break_pct, hole.slope_pct,
+                     WINDMILL_GARDENS.stimp, features=hole.features)
+    assert g.hole_pos[0] == 1.0
+    made = any(g.simulate((0, 0), spd / 10.0, hla / 10.0).holed
+               for spd in range(18, 66, 2)
+               for hla in range(-240, 241, 15))
+    assert made
+
+
+def test_every_minigolf_hole_is_winnable():
+    """Brute-force each hole with a REALISTIC putt fan (<= 6.4 mph and
+    |HLA| <= 24 deg relative to the cup line, which is what a real putt
+    off the mat can deliver). Every hole must be aceable from the tee."""
+    for course in (WINDMILL_GARDENS, PORTAL_PARK):
+        for hole in course.holes:
+            g = GreenPhysics(hole.distance_ft, hole.break_pct,
+                             hole.slope_pct, course.stimp,
+                             features=hole.features)
+            made = False
+            for spd in range(18, 66, 2):
+                for hla in range(-240, 241, 15):
+                    if g.simulate((0, 0), spd / 10.0, hla / 10.0,
+                                  dt=1 / 240.0).holed:
+                        made = True
+                        break
+                if made:
+                    break
+            assert made, f"{course.name} #{hole.number} {hole.name} unwinnable"
+
+
+def test_simulation_always_terminates_in_rails():
+    # hardest case: lively bumper field fully enclosed
+    hole = PORTAL_PARK.holes[2]
+    g = GreenPhysics(hole.distance_ft, 0.0, 0.0, 12.0,
+                     features=hole.features)
+    r = g.simulate((0, 0), 8.0, 13.0)
+    fx, fy = r.final_pos
+    assert -1.25 <= fx <= 1.25 and -0.85 <= fy <= 4.5

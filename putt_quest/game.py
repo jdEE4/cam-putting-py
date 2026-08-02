@@ -228,7 +228,8 @@ class Game:
             return
         h = self.round.hole
         self.physics = GreenPhysics(h.distance_ft, h.break_pct,
-                                    h.slope_pct, self.current_stimp())
+                                    h.slope_pct, self.current_stimp(),
+                                    features=h.features)
         self._preview_key = None
 
     # ---------------------------------------------------- resolution
@@ -242,7 +243,8 @@ class Game:
                 and self.physics is not None):
             hole = self.round.hole
             self.scene = GreenScene((w, h), hole.distance_ft * FT_TO_M,
-                                    hole.break_pct, hole.slope_pct)
+                                    hole.break_pct, hole.slope_pct,
+                                    features=hole.features)
             self.scene.position_camera(self.ball.pos)
         self._guard_cooldown = 2.0
         self._low_fps_time = 0.0
@@ -261,12 +263,14 @@ class Game:
         self.round.hole_idx = idx
         h = self.round.hole
         self.physics = GreenPhysics(h.distance_ft, h.break_pct,
-                                    h.slope_pct, self.current_stimp())
+                                    h.slope_pct, self.current_stimp(),
+                                    features=h.features)
         self.ball = Ball(0.0, 0.0)
         self.trail = []
         self.scene = GreenScene((gfx.INTERNAL_W, gfx.INTERNAL_H),
                                 h.distance_ft * FT_TO_M,
-                                h.break_pct, h.slope_pct)
+                                h.break_pct, h.slope_pct,
+                                features=h.features)
         self.scene.position_camera(self.ball.pos)
         self.state = State.AWAIT_PUTT
         self.last_shot_info = ""
@@ -370,11 +374,16 @@ class Game:
 
         if self.state == State.ROLLING and self.physics:
             for _ in range(PHYS_SUBSTEPS):
-                result = self.physics.step(self.ball, dt / PHYS_SUBSTEPS)
+                result = self.physics.step(self.ball, dt / PHYS_SUBSTEPS,
+                                           self.time)
                 self.trail.append(self.ball.pos)
                 if result == "lipout":
                     self.lipped = True
                     self.set_banner("Lip out!", 1.5)
+                elif result == "portal":
+                    self.set_banner("Warped!", 1.2)
+                elif result == "windmill":
+                    self.set_banner("Clang! Off the windmill", 1.2)
                 elif result == "holed":
                     self.finish_hole(holed=True)
                     break
