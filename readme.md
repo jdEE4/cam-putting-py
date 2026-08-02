@@ -1,5 +1,17 @@
 # Webcam based putting simulation for GSPRO utilizing the R10 and MLM2Pro connector:
 
+## One-click executable (no Python required)
+
+Build a single self-contained binary:
+
+```
+build_exe.bat          # Windows  -> dist\PuttQuest.exe
+./build_exe.sh         # macOS/Linux -> dist/PuttQuest
+```
+
+Double-clicking the result opens a menu with PLAY (tracker + game),
+CALIBRATE CAMERA, SET UP PUTT ZONE and GAME ONLY. See USER_GUIDE.md.
+
 ## Quick start (Windows)
 
 Double-click (or run from a terminal) the matching launcher in the repository root:

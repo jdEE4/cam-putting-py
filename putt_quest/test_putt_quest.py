@@ -190,6 +190,7 @@ def test_mulligan_undoes_last_putt():
 
 # ---------------------------------------------------------- mini golf
 import math
+import os
 
 from putt_quest.courses import COURSES, PORTAL_PARK, WINDMILL_GARDENS
 from putt_quest.minigolf import (Boost, HoleFeatures, Portal, Sand, Wall,
@@ -368,3 +369,152 @@ def test_sfx_manager_safe_without_audio():
     from putt_quest.sounds import SFX
     s = SFX()                    # may or may not find a device
     s.play("sink")               # must never raise either way
+
+
+# ------------------------------------------- auto-advance + shot stats
+def _fresh_game():
+    import os
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+    from putt_quest.game import Game
+    return Game()
+
+
+def test_hole_auto_advances_after_timeout():
+    from putt_quest.game import State
+    from putt_quest.courses import COURSES
+    g = _fresh_game()
+    g.advance_secs = 5.0
+    g.start_round(COURSES[0])
+    g.finish_hole(holed=True)
+    assert g.state == State.HOLE_DONE
+    start_idx = g.round.hole_idx
+    # not yet: only 2s of game time have passed
+    g.time += 2.0
+    g.update(0.016)
+    assert g.round.hole_idx == start_idx
+    # past the timeout: the next hole loads with no key press
+    g.time += 4.0
+    g.update(0.016)
+    assert g.round.hole_idx == start_idx + 1
+    assert g.state == State.AWAIT_PUTT
+
+
+def test_auto_advance_off_waits_for_enter():
+    from putt_quest.game import State
+    from putt_quest.courses import COURSES
+    g = _fresh_game()
+    g.advance_secs = 0.0                 # OFF
+    g.start_round(COURSES[0])
+    g.finish_hole(holed=True)
+    g.time += 60.0
+    g.update(0.016)
+    assert g.state == State.HOLE_DONE     # still waiting
+    assert g.round.hole_idx == 0
+
+
+def test_auto_advance_paused_while_settings_open():
+    from putt_quest.game import State
+    from putt_quest.courses import COURSES
+    g = _fresh_game()
+    g.advance_secs = 3.0
+    g.start_round(COURSES[0])
+    g.finish_hole(holed=True)
+    g.settings_open = True
+    g.time += 30.0
+    g.update(0.016)
+    assert g.state == State.HOLE_DONE     # timer held while the menu is up
+    g.settings_open = False
+    g.update(0.016)
+    assert g.state == State.AWAIT_PUTT
+
+
+def test_shot_stats_recorded_for_each_putt():
+    from putt_quest.courses import COURSES
+    g = _fresh_game()
+    g.start_round(COURSES[0])
+    g.take_shot(3.5, 1.0)
+    for _ in range(1200):                 # roll it out
+        g.update(1 / 60.0)
+        if g._shot is None:
+            break
+    assert len(g.round.shots) == 1
+    s = g.round.shots[0]
+    assert s.speed_mph == 3.5 and s.hla_deg == 1.0
+    assert s.rollout_ft > 0.5
+    assert s.pace_hint_mph > 0
+    assert s.verdict
+    assert g.last_stat is s
+
+
+def test_round_stats_aggregate():
+    from putt_quest.courses import COURSES
+    g = _fresh_game()
+    g.start_round(COURSES[0])
+    for mph in (2.0, 4.0):
+        g.take_shot(mph, 0.0)
+        for _ in range(1200):
+            g.update(1 / 60.0)
+            if g._shot is None:
+                break
+        if g.state.name == "HOLE_DONE":
+            break
+    st = g.round.stats
+    assert st["putts"] >= 1
+    assert 0 < st["avg_mph"] <= 4.0
+    assert "make_pct" in st and 0 <= st["make_pct"] <= 100
+
+
+def test_shot_stat_verdicts():
+    from putt_quest.game import ShotStat
+    holed = ShotStat(1, 1, 3.0, 0.0, 8.0, holed=True, pace_hint_mph=3.0)
+    assert holed.verdict == "HOLED"
+    firm = ShotStat(1, 1, 5.0, 0.0, 8.0, pace_hint_mph=3.0)
+    assert firm.verdict == "TOO FIRM"
+    short = ShotStat(1, 1, 1.5, 0.0, 8.0, pace_hint_mph=3.0)
+    assert short.verdict == "LEFT SHORT"
+    push = ShotStat(1, 1, 3.0, 5.0, 8.0, pace_hint_mph=3.0)
+    assert push.verdict == "PUSHED"
+    good = ShotStat(1, 1, 3.0, 0.5, 8.0, pace_hint_mph=3.0)
+    assert good.verdict == "GOOD PACE"
+
+
+def test_setup_reticle_draws_in_every_state():
+    """The animated ball-setup indicator must render without a window."""
+    import pygame
+    from putt_quest.render3d import GreenScene
+    pygame.init()
+    scene = GreenScene((640, 360), 3.0, 0.0, 0.0)
+    scene.position_camera((0.0, 0.0))
+    canvas = pygame.Surface((640, 360))
+    for lock, ready, detected in ((0.0, False, False),   # searching
+                                  (0.45, False, True),   # locking
+                                  (1.0, True, True)):    # ready
+        scene.draw_setup_reticle(canvas, (0.0, 0.0), 1.0, lock, ready,
+                                 detected)
+
+
+# ------------------------------------------------- packaged executable
+def test_app_entry_exposes_tools_and_modes():
+    import putt_quest_app as app
+    assert set(app.TOOLS) == {"tracker", "setup", "calibrate"}
+    for script in app.TOOLS.values():
+        path = os.path.join(os.path.dirname(os.path.abspath(app.__file__)),
+                            script)
+        assert os.path.exists(path), f"bundled tool missing: {script}"
+    assert callable(app.play) and callable(app.launcher)
+    assert os.path.isdir(app.bundle_dir())
+
+
+def test_app_spec_lists_every_runtime_dependency():
+    """The spec must ship the runpy'd scripts and declare their imports,
+    otherwise the frozen exe dies the first time you click CALIBRATE."""
+    import putt_quest_app as app
+    root = os.path.dirname(os.path.abspath(app.__file__))
+    spec = open(os.path.join(root, "PuttQuest.spec")).read()
+    for script in list(app.TOOLS.values()) + ["ColorModuleExtended.py"]:
+        assert f"'{script}'" in spec, f"{script} not bundled in the spec"
+    for mod in ("cv2", "numpy", "requests", "cvzone", "imutils",
+                "pygame", "putt_quest.game", "putt_quest.sounds"):
+        assert f"'{mod}'" in spec, f"{mod} missing from hiddenimports"
+

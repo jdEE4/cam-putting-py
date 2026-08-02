@@ -7,3 +7,8 @@ readme-priv.md
 .vscode
 __pycache__/
 putt_quest_settings.json
+
+# PyInstaller output
+/dist/
+/build/PuttQuest/
+*.manifest

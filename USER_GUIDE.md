@@ -270,3 +270,49 @@ a sink animation, screen shake on hard hits, directional lighting on the
 terrain, and per-course sky themes. Toggle audio in Settings (O) under
 "Sound Effects"; everything degrades gracefully on machines with no audio
 device.
+
+## One-click executable
+
+You can build a single self-contained file that needs **no Python install**
+on the target machine:
+
+```
+build_exe.bat          (Windows  -> dist\PuttQuest.exe)
+./build_exe.sh         (macOS/Linux -> dist/PuttQuest)
+```
+
+The build takes a few minutes and produces one ~100 MB binary. Share that
+file; the player double-clicks it and gets a menu:
+
+| Menu item | What it does |
+| --- | --- |
+| PLAY | starts the ball tracker **and** the game together |
+| CALIBRATE CAMERA | exposure / gain / ball-colour wizard |
+| SET UP PUTT ZONE | drag the start zone, auto-detect putt direction |
+| GAME ONLY | keyboard test mode, no camera needed |
+
+On first run the exe writes `config.ini`, `error.png` and its settings next
+to itself (or to `~/PuttQuest` if that folder is read-only), so calibration
+persists between runs. Command-line shortcuts still work:
+`PuttQuest.exe --play`, `--game`.
+
+> First launch takes ~10–20 seconds while the bundle unpacks itself; later
+> launches are quicker. The console window stays open on purpose — the
+> tracker prints each putt's ball speed and HLA there.
+
+## Auto-advance and shot stats
+
+- **Auto-advance**: after a hole is finished the next one loads by itself.
+  A countdown ring shows the remaining time and ENTER always skips ahead
+  immediately. Change the delay (or turn it off) in Settings → *Auto-Advance
+  Hole*; the timer pauses while the settings or help overlay is open.
+- **Shot stats card**: every putt automatically pops a card with ball speed,
+  HLA, rollout, how your pace compared to the ideal for that distance, and
+  the result — plus a plain-English verdict (GOOD PACE / TOO FIRM / LEFT
+  SHORT / PUSHED / PULLED). Toggle it in Settings → *Shot Stats Card*.
+- **Round stats**: the scorecard now shows putts, makes and make %, average
+  ball speed, average pace error, average absolute HLA and your longest roll.
+- **Ball setup animation**: while the game waits for a putt, an animated
+  reticle is drawn on the green where your ball sits — sonar rings while the
+  tracker searches, a filling arc while the ball locks, and a steady pulse
+  with rotating ticks once it's READY.

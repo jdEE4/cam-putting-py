@@ -78,6 +78,9 @@ SAND_DARK = (178, 158, 108)
 WATER_DEEP = (18, 52, 86)
 WATER_EDGE = (96, 158, 198)
 WATER_GLINT = (196, 230, 250)
+GOOD_RING = (120, 235, 130)
+WARN_RING = (255, 196, 70)
+BAD_RING = (232, 96, 80)
 CHUTE_TOP = (172, 178, 194)
 CHUTE_SIDE = (118, 124, 140)
 CHUTE_FLOOR = (52, 56, 68)
@@ -653,6 +656,58 @@ class GreenScene:
                 r = max(1, int(self.cam.scale_at(p[2]) * 0.010 * tw))
                 pygame.draw.circle(canvas, WATER_GLINT,
                                    (int(p[0]), int(p[1])), r)
+
+    def draw_setup_reticle(self, canvas: pygame.Surface, pos: Vec2,
+                           t: float, lock: float, ready: bool,
+                           detected: bool) -> None:
+        """Animated ball-setup indicator drawn on the green itself:
+        expanding scan rings while searching, a filling lock arc while the
+        ball settles, and a steady pulse + tick marks once it's ready."""
+        x, y = pos
+        base = self.cam.project(self.surface_pt(x, y, 0.004))
+        if base is None:
+            return
+        px, py = int(base[0]), int(base[1])
+        ppm = self.cam.scale_at(base[2])
+        col = (GOOD_RING if ready else
+               WARN_RING if detected else BAD_RING)
+
+        def ellipse(rad_m, width=1, color=col, alpha=255):
+            rx = max(2, int(ppm * rad_m))
+            ry = max(1, int(rx * 0.42))          # flattened by perspective
+            surf = pygame.Surface((rx * 2 + 4, ry * 2 + 4), pygame.SRCALPHA)
+            pygame.draw.ellipse(surf, (*color, alpha),
+                                (2, 2, rx * 2, ry * 2), width)
+            canvas.blit(surf, (px - rx - 2, py - ry - 2))
+
+        if ready:
+            # locked: steady double ring + rotating tick marks
+            ellipse(0.16, 2, alpha=235)
+            pulse = 0.20 + 0.05 * math.sin(t * 4.5)
+            ellipse(pulse, 1, alpha=150)
+            for k in range(4):
+                a = t * 1.1 + k * math.pi / 2
+                rx, ry = ppm * 0.26, ppm * 0.26 * 0.42
+                tx, ty = px + math.cos(a) * rx, py + math.sin(a) * ry
+                pygame.draw.circle(canvas, col, (int(tx), int(ty)), 2)
+        elif detected:
+            # settling: scan ring closes in, arc fills with the lock meter
+            ellipse(0.30 - 0.12 * lock, 1, alpha=170)
+            rx, ry = ppm * 0.20, ppm * 0.20 * 0.42
+            steps = max(2, int(26 * max(lock, 0.02)))
+            pts = [(px + math.cos(-math.pi / 2 + 2 * math.pi * lock
+                                  * (i / steps)) * rx,
+                    py + math.sin(-math.pi / 2 + 2 * math.pi * lock
+                                  * (i / steps)) * ry)
+                   for i in range(steps + 1)]
+            if len(pts) > 1:
+                pygame.draw.lines(canvas, col, False, pts, 2)
+        else:
+            # searching: two expanding sonar rings
+            for k in (0.0, 0.5):
+                ph = ((t * 0.8 + k) % 1.0)
+                ellipse(0.10 + 0.26 * ph, 1,
+                        alpha=int(150 * (1.0 - ph)))
 
     def _draw_portal_glow(self, canvas: pygame.Surface, t: float) -> None:
         f = self.features
