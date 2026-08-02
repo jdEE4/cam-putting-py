@@ -303,3 +303,68 @@ def test_simulation_always_terminates_in_rails():
     r = g.simulate((0, 0), 8.0, 13.0)
     fx, fy = r.final_pos
     assert -1.25 <= fx <= 1.25 and -0.85 <= fy <= 4.5
+
+
+# ------------------------------------------------- next-level features
+from putt_quest.courses import SUMMIT_FALLS
+from putt_quest.minigolf import Chute, Ramp, Water
+
+
+def test_ramp_uphill_shortens_downhill_lengthens():
+    up = HoleFeatures(ramps=(Ramp(-1.0, 1.0, 1.0, 2.2, rise=0.22),))
+    dn = HoleFeatures(ramps=(Ramp(-1.0, 1.0, 1.0, 2.2, rise=0.22,
+                                  flip=True),))
+    flat = GreenPhysics(20.0, 0.0, 0.0, 10.0)
+    g_up = GreenPhysics(20.0, 0.0, 0.0, 10.0, features=up)
+    g_dn = GreenPhysics(20.0, 0.0, 0.0, 10.0, features=dn)
+    r_flat = flat.simulate((0, 0), 4.0, 0.0).rollout_m
+    assert g_up.simulate((0, 0), 4.0, 0.0).rollout_m < r_flat
+    assert g_dn.simulate((0, 0), 4.0, 0.0).rollout_m > r_flat
+
+
+def test_chute_carries_ball_to_exit():
+    ch = Chute(points=((0.0, 1.5), (0.6, 2.0), (1.2, 2.6), (1.2, 3.2)))
+    g = GreenPhysics(14.0, 0.0, 0.0, 10.0,
+                     features=HoleFeatures(chutes=(ch,)))
+    r = g.simulate((0, 0), 3.0, 0.0)
+    assert any(math.hypot(x - 1.2, y - 3.2) < 0.15 for x, y in r.path)
+
+
+def test_water_ends_roll_in_pool():
+    g = GreenPhysics(14.0, 0.0, 0.0, 10.0,
+                     features=HoleFeatures(water=(Water(0.0, 2.0, 0.4),)))
+    r = g.simulate((0, 0), 4.0, 0.0)
+    assert not r.holed
+    assert math.hypot(r.final_pos[0], r.final_pos[1] - 2.0) <= 0.45
+
+
+def test_summit_falls_every_hole_winnable():
+    for hole in SUMMIT_FALLS.holes:
+        g = GreenPhysics(hole.distance_ft, hole.break_pct, hole.slope_pct,
+                         SUMMIT_FALLS.stimp, features=hole.features)
+        made = False
+        for spd in range(18, 66, 2):
+            for hla in range(-240, 241, 15):
+                if g.simulate((0, 0), spd / 10.0, hla / 10.0,
+                              dt=1 / 240.0).holed:
+                    made = True
+                    break
+            if made:
+                break
+        assert made, f"Summit Falls #{hole.number} {hole.name} unwinnable"
+
+
+def test_sfx_bank_synthesizes():
+    # sound synthesis must not require an audio device to at least build
+    from putt_quest import sounds
+    bank = sounds._build_all()
+    assert {"putt", "wall", "bumper", "windmill", "portal", "splash",
+            "chute", "sink", "fanfare"} <= set(bank)
+    for name, sig in bank.items():
+        assert len(sig) > 100 and float(abs(sig).max()) <= 1.0, name
+
+
+def test_sfx_manager_safe_without_audio():
+    from putt_quest.sounds import SFX
+    s = SFX()                    # may or may not find a device
+    s.play("sink")               # must never raise either way

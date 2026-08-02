@@ -236,7 +236,10 @@ Links Test:
   dogleg and a keyhole gate.
 - **Portal Park** (stimp 10.5) — physics-park golf: teleporter rings,
   conveyor boost pads, a pinball field, a four-armed windmill, and the
-  everything-at-once finale "Event Horizon".
+  everything-at-once finale "Event Horizon". Played under a dusk sky.
+- **Summit Falls** (stimp 10) — alpine elevation golf: real raised ramps
+  and hills, water hazards, and flume chutes that carry the ball over the
+  ponds. Finale: "Summit Falls", over the summit and down the flume.
 
 How the obstacles behave:
 
@@ -248,8 +251,22 @@ How the obstacles behave:
 | Portal rings | entering either ring teleports the ball out of the other, keeping its direction |
 | Sand | heavy friction — the ball dies quickly |
 | Boost pads | push the ball along the printed chevrons |
+| Ramps / hills | real elevation — uphill kills pace, downhill adds it |
+| Flume chutes | swallow the ball at the mouth and carry it along the tube (even over water), releasing it at a controlled speed |
+| Water | splash! The ball is replayed from where the putt started (the stroke counts) |
 
 Every hole is fully enclosed (the ball cannot leave) and every hole is
 verified ace-able with a realistic putt (max ~6.4 mph, within about 24
 degrees of the cup line) — the test suite brute-forces each one. Cups in
 mini golf mode are wider than regulation, like the real thing.
+
+### Presentation
+
+The game now ships with synthesized sound effects (putter click, rail
+knocks, bumper boings, windmill clangs, portal warps, splashes, the cup
+chime, and a round-end fanfare — all generated at startup, no audio files),
+particle effects (confetti on a make, sparks, splashes, sand poofs),
+a sink animation, screen shake on hard hits, directional lighting on the
+terrain, and per-course sky themes. Toggle audio in Settings (O) under
+"Sound Effects"; everything degrades gracefully on machines with no audio
+device.

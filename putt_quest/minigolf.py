@@ -79,6 +79,56 @@ class Boost:
 
 
 @dataclass(frozen=True)
+class Ramp:
+    """Raised wedge. The terrain rises linearly from the low edge to the
+    high edge; the ball decelerates going up and accelerates coming down.
+    axis 'y': low at y0, high at y1 (flip=True reverses). axis 'x': low at
+    x0, high at x1. Rendered as real elevation in the 3D view."""
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    rise: float = 0.15          # height of the high edge (m)
+    axis: str = "y"
+    flip: bool = False
+
+    def height_at(self, x: float, y: float) -> float:
+        if not (self.x0 <= x <= self.x1 and self.y0 <= y <= self.y1):
+            return 0.0
+        if self.axis == "y":
+            t = (y - self.y0) / max(1e-6, self.y1 - self.y0)
+        else:
+            t = (x - self.x0) / max(1e-6, self.x1 - self.x0)
+        if self.flip:
+            t = 1.0 - t
+        return self.rise * t
+
+    @property
+    def grade(self) -> float:
+        span = (self.y1 - self.y0) if self.axis == "y" else (self.x1 - self.x0)
+        return self.rise / max(1e-6, span)
+
+
+@dataclass(frozen=True)
+class Chute:
+    """Enclosed channel: the ball is captured at the mouth (first point)
+    and carried along the polyline, then released at the far end moving
+    along the exit tangent. Gravity-fed: it gains a little speed inside."""
+    points: Tuple[Tuple[float, float], ...]
+    r: float = 0.14             # capture radius at the mouth
+    min_speed: float = 0.25     # slower than this rolls past, not in
+
+
+@dataclass(frozen=True)
+class Water:
+    """Splash hazard: the ball is fished out and replayed from where the
+    putt started (stroke already counts, like real mini golf)."""
+    x: float
+    y: float
+    r: float
+
+
+@dataclass(frozen=True)
 class HoleFeatures:
     walls: Tuple[Wall, ...] = ()
     bumpers: Tuple[Bumper, ...] = ()
@@ -86,9 +136,19 @@ class HoleFeatures:
     portals: Tuple[Portal, ...] = ()
     sand: Tuple[Sand, ...] = ()
     boosts: Tuple[Boost, ...] = ()
+    ramps: Tuple[Ramp, ...] = ()
+    chutes: Tuple[Chute, ...] = ()
+    water: Tuple[Water, ...] = ()
     cup_x: float = 0.0          # lateral cup offset (doglegs)
     half_w: float = 0.0         # >0 overrides the green pad half-width
     cup_scale: float = 1.8      # mini golf cups are wider than regulation
+
+    def height_at(self, x: float, y: float) -> float:
+        """Extra terrain elevation from ramps at a world point."""
+        h = 0.0
+        for r in self.ramps:
+            h += r.height_at(x, y)
+        return h
 
     @property
     def tags(self) -> str:
@@ -101,6 +161,12 @@ class HoleFeatures:
             bits.append("bumpers")
         if self.portals:
             bits.append("portals")
+        if self.ramps:
+            bits.append("ramps")
+        if self.chutes:
+            bits.append("chute")
+        if self.water:
+            bits.append("water")
         if self.sand:
             bits.append("sand")
         if self.boosts:

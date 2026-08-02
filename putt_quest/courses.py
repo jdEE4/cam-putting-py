@@ -15,8 +15,8 @@ COURSES. The game auto-lists anything found here.
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from .minigolf import (Boost, Bumper, HoleFeatures, Portal, Sand, Wall,
-                       Windmill, rails)
+from .minigolf import (Boost, Bumper, Chute, HoleFeatures, Portal, Ramp,
+                       Sand, Wall, Water, Windmill, rails)
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,7 @@ class Course:
     name: str
     stimp: float                # green speed (stimpmeter feet). 8 slow .. 13 fast
     holes: List[Hole] = field(default_factory=list)
+    theme: str = "day"          # sky/lighting theme: day | dusk | alpine
 
     @property
     def par(self) -> int:
@@ -161,6 +162,7 @@ WINDMILL_GARDENS = Course(
 PORTAL_PARK = Course(
     name="Portal Park",
     stimp=10.5,
+    theme="dusk",
     holes=[
         # 1 — a wall seals the hole off completely; the portal IS the route
         _mg(1, "Warp Opener", 9.0, HoleFeatures(
@@ -227,4 +229,73 @@ PORTAL_PARK = Course(
 )
 
 
-COURSES: List[Course] = [CLASSIC_9, LINKS_9, WINDMILL_GARDENS, PORTAL_PARK]
+SUMMIT_FALLS = Course(
+    name="Summit Falls",
+    stimp=10.0,
+    theme="alpine",
+    holes=[
+        # 1 — a gentle ramp to learn how elevation plays
+        _mg(1, "Base Camp", 10.0, HoleFeatures(
+            walls=rails(-0.9, -0.8, 0.9, 3.85),
+            ramps=(Ramp(-0.9, 1.3, 0.9, 2.1, rise=0.12),),
+            half_w=1.6)),
+        # 2 — thread the bridge between two ponds
+        _mg(2, "The Moat", 11.0, HoleFeatures(
+            walls=rails(-1.0, -0.8, 1.0, 4.15),
+            water=(Water(-0.55, 1.9, 0.38), Water(0.55, 1.9, 0.38)),
+            half_w=1.7)),
+        # 3 — a wall seals the fairway; the flume is the only way through
+        _mg(3, "The Flume", 12.0, HoleFeatures(
+            walls=rails(-1.0, -0.8, 1.0, 4.45) + (Wall(-1.0, 1.8, 1.0, 1.8),),
+            chutes=(Chute(points=((0.0, 1.5), (0.45, 1.95),
+                                  (0.75, 2.5), (0.35, 3.05))),),
+            half_w=1.7)),
+        # 4 — carry the A-frame hill, then coast to the cup
+        _mg(4, "Ridge Runner", 13.0, HoleFeatures(
+            walls=rails(-1.0, -0.8, 1.0, 4.75),
+            ramps=(Ramp(-1.0, 1.4, 1.0, 2.05, rise=0.16),
+                   Ramp(-1.0, 2.05, 1.0, 2.7, rise=0.16, flip=True)),
+            half_w=1.7)),
+        # 5 — twin lakes pinch the line; sand saves the long miss
+        _mg(5, "Twin Lakes", 14.0, HoleFeatures(
+            walls=rails(-1.1, -0.8, 1.1, 5.1),
+            water=(Water(-0.62, 2.4, 0.4), Water(0.62, 2.4, 0.4)),
+            sand=(Sand(0.0, 4.9, 0.35),),
+            half_w=1.8), slope=-0.5),
+        # 6 — ride the flume OVER the pond (or brave the narrow banks)
+        _mg(6, "The Cascade", 15.0, HoleFeatures(
+            walls=rails(-1.1, -0.8, 1.1, 5.4),
+            water=(Water(-0.05, 2.6, 0.55),),
+            chutes=(Chute(points=((-0.5, 1.6), (-0.3, 2.2), (0.0, 2.6),
+                                  (0.25, 3.0), (0.13, 3.62))),),
+            half_w=1.8)),
+        # 7 — a downhill launch pad into a bumper field
+        _mg(7, "Avalanche", 15.0, HoleFeatures(
+            walls=rails(-1.1, -0.8, 1.1, 5.4),
+            ramps=(Ramp(-1.1, 1.2, 1.1, 1.9, rise=0.14, flip=True),),
+            bumpers=(Bumper(-0.55, 2.8), Bumper(0.55, 3.3)),
+            sand=(Sand(0.0, 5.05, 0.38),),
+            half_w=1.8)),
+        # 8 — up the ridge, between the lakes, onto the conveyor
+        _mg(8, "Grand Traverse", 17.0, HoleFeatures(
+            walls=rails(-1.2, -0.8, 1.2, 6.0),
+            ramps=(Ramp(-1.2, 1.3, 1.2, 2.0, rise=0.13),),
+            water=(Water(-0.7, 3.2, 0.4), Water(0.7, 3.2, 0.4)),
+            boosts=(Boost(-1.2, 3.9, 1.2, 4.5, ay=1.5),),
+            half_w=1.9)),
+        # 9 — over the summit, flume past the falls, dodge the last bunker
+        _mg(9, "Summit Falls", 20.0, HoleFeatures(
+            walls=rails(-1.4, -0.8, 1.4, 6.9),
+            ramps=(Ramp(-1.4, 1.5, 1.4, 2.2, rise=0.17),
+                   Ramp(-1.4, 2.2, 1.4, 2.9, rise=0.17, flip=True)),
+            water=(Water(-0.8, 3.8, 0.42), Water(0.85, 4.6, 0.4)),
+            chutes=(Chute(points=((0.0, 3.4), (0.35, 4.1),
+                                  (0.28, 4.7), (0.1, 5.5))),),
+            sand=(Sand(-0.7, 5.8, 0.35),),
+            half_w=2.1), slope=-0.8, par=3),
+    ],
+)
+
+
+COURSES: List[Course] = [CLASSIC_9, LINKS_9, WINDMILL_GARDENS, PORTAL_PARK,
+                         SUMMIT_FALLS]

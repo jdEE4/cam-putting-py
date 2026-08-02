@@ -71,15 +71,18 @@ def set_internal(w: int, h: int) -> pygame.Surface:
     return pygame.Surface((w, h))
 
 
-def blit_scaled(win: pygame.Surface, canvas: pygame.Surface) -> None:
-    """Smooth-fit the canvas into the window, preserving aspect ratio."""
+def blit_scaled(win: pygame.Surface, canvas: pygame.Surface,
+                offset: Tuple[int, int] = (0, 0)) -> None:
+    """Smooth-fit the canvas into the window, preserving aspect ratio.
+    `offset` shifts the blit a few pixels (screen-shake effect)."""
     ww, wh = win.get_size()
     iw, ih = canvas.get_size()
     scale = min(ww / iw, wh / ih)
     dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
     scaled = pygame.transform.smoothscale(canvas, (dw, dh))
     win.fill((0, 0, 0))
-    win.blit(scaled, ((ww - dw) // 2, (wh - dh) // 2))
+    win.blit(scaled, ((ww - dw) // 2 + offset[0],
+                      (wh - dh) // 2 + offset[1]))
 
 
 # ------------------------------- text --------------------------------

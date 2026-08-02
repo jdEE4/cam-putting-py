@@ -84,6 +84,8 @@ class GreenPhysics:
         self.cup_r = CUP_RADIUS * (features.cup_scale
                                    if features is not None else 1.0)
         self._portal_cd = 0.0       # portal re-entry cooldown timer
+        # chute transport state: (chute, dist_along, speed) or None
+        self._chute = None
         # deceleration magnitude from green friction
         stimp_m = stimp * FT_TO_M
         self.mu_a = (1.83 ** 2) / (2.0 * stimp_m)
@@ -109,7 +111,56 @@ class GreenPhysics:
             if b.x0 <= x <= b.x1 and b.y0 <= y <= b.y1:
                 ax += b.ax
                 ay += b.ay
+        # ramps: gravity pulls toward the low edge while on the wedge
+        for r in self.features.ramps:
+            if r.x0 <= x <= r.x1 and r.y0 <= y <= r.y1:
+                pull = G * r.grade * (1.0 if r.flip else -1.0)
+                if r.axis == "y":
+                    ay += pull
+                else:
+                    ax += pull
         return (ax, ay)
+
+    # ------------------------------------------------------ chute ride
+    @staticmethod
+    def _chute_geom(chute):
+        segs = []
+        total = 0.0
+        pts = chute.points
+        for i in range(len(pts) - 1):
+            dx = pts[i + 1][0] - pts[i][0]
+            dy = pts[i + 1][1] - pts[i][1]
+            L = math.hypot(dx, dy)
+            segs.append((pts[i], (dx / max(L, 1e-9), dy / max(L, 1e-9)), L))
+            total += L
+        return segs, total
+
+    def _chute_pos(self, chute, s: float):
+        segs, total = self._chute_geom(chute)
+        s = max(0.0, min(s, total))
+        for (p0, u, L) in segs:
+            if s <= L:
+                return (p0[0] + u[0] * s, p0[1] + u[1] * s), u
+            s -= L
+        (p0, u, L) = segs[-1]
+        return (p0[0] + u[0] * L, p0[1] + u[1] * L), u
+
+    CHUTE_CRUISE = 1.35     # m/s: tube friction regulates toward this
+
+    def _ride_chute(self, ball: Ball, dt: float) -> Optional[str]:
+        chute, s, sp = self._chute
+        # converge to cruise speed so exits are predictable (and holeable)
+        sp = sp + (self.CHUTE_CRUISE - sp) * min(1.0, 3.0 * dt)
+        s += sp * dt
+        _, total = self._chute_geom(chute)
+        (x, y), u = self._chute_pos(chute, s)
+        ball.x, ball.y = x, y
+        ball.vx, ball.vy = u[0] * sp, u[1] * sp
+        if s >= total:                            # released at the far end
+            self._chute = None
+            return "chute_exit"
+        self._chute = (chute, s, sp)
+        return "chute"
 
     @staticmethod
     def _bounce_off_point(ball: Ball, cx: float, cy: float, min_dist: float,
@@ -154,7 +205,20 @@ class GreenPhysics:
         for b in f.bumpers:
             if self._bounce_off_point(ball, b.x, b.y, b.r + BALL_R,
                                       BUMPER_RESTITUTION):
-                event = "bounce"
+                event = "bumper"
+        for w in f.water:
+            if (ball.x - w.x) ** 2 + (ball.y - w.y) ** 2 <= w.r * w.r:
+                ball.vx = ball.vy = 0.0     # the drink ends the roll
+                return "water"
+        if self._chute is None:
+            for ch in f.chutes:
+                mx, my = ch.points[0]
+                sp = ball.speed
+                if (sp >= ch.min_speed
+                        and (ball.x - mx) ** 2 + (ball.y - my) ** 2
+                        <= ch.r * ch.r):
+                    self._chute = (ch, 0.0, max(sp, 0.6))
+                    return "chute_enter"
         for m in f.windmills:
             # NOTE: no hub collision — the ball rolls under the axle like a
             # real crazy-golf windmill; only the sweeping blades block.
@@ -216,6 +280,8 @@ class GreenPhysics:
         still rolling. `t` is absolute time, used to phase windmills."""
         if self._portal_cd > 0.0:
             self._portal_cd -= dt
+        if self._chute is not None:         # riding inside a chute
+            return self._ride_chute(ball, dt)
         sp = ball.speed
         if sp < STOP_SPEED:
             ball.vx = ball.vy = 0.0
@@ -267,6 +333,7 @@ class GreenPhysics:
         """Headless full simulation (used for tests / AI preview)."""
         ball = Ball(start[0], start[1])
         self._portal_cd = 0.0
+        self._chute = None
         self.launch(ball, speed_mph, hla_deg)
         path = [ball.pos]
         lipped = False
