@@ -12,3 +12,7 @@ putt_quest_settings.json
 /dist/
 /build/PuttQuest/
 *.manifest
+# stray file created by an unquoted ">=" in a batch pip install
+/6.0
+/=6.0
+puttquest-crash.log

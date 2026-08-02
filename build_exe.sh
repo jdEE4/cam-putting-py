@@ -13,7 +13,7 @@ fi
 "$PYTHON_BIN" -m pip install --upgrade pip
 "$PYTHON_BIN" -m pip install -r "$ROOT_DIR/requirements.txt"
 "$PYTHON_BIN" -m pip install -r "$ROOT_DIR/requirements-game.txt"
-"$PYTHON_BIN" -m pip install "pyinstaller>=6.0"
+"$PYTHON_BIN" -m pip install -r "$ROOT_DIR/requirements-build.txt"
 
 rm -rf "$ROOT_DIR/build/PuttQuest" "$ROOT_DIR/dist/PuttQuest"
 cd "$ROOT_DIR"
