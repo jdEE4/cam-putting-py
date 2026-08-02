@@ -580,14 +580,15 @@ else:
 
 
 if type(video_fps) == float:
-    if video_fps == 0.0:
-        e = vs.set(cv2.CAP_PROP_FPS, 60)
-        new_fps = []
-        new_fps.append(0)
-
+    new_fps = []
     if video_fps > 0.0:
-        new_fps = []
         new_fps.append(video_fps)
+    else:
+        # 0.0 = driver did not report a rate; -1.0 = no camera opened at all.
+        # Ask for 60 and carry on so the "No Camera could be opened" message
+        # below can actually be shown instead of crashing on an undefined name.
+        e = vs.set(cv2.CAP_PROP_FPS, 60)
+        new_fps.append(0)
     video_fps = new_fps
 
 

@@ -55,6 +55,8 @@ MAX_STIMP = 14.0
 STIMP_STEP = 0.5
 AIM_TRIM_STEP = 0.5
 MAX_AIM_TRIM = 10.0            # ± degrees you can bias camera-mode putts
+HOLE_ADVANCE_CHOICES = [0.0, 3.0, 5.0, 8.0, 12.0]   # 0 = wait for ENTER
+DEFAULT_ADVANCE_SECS = 5.0     # auto-advance to the next hole after this
 TRACKER_FRESH_SECS = 2.5       # status ping older than this = tracker gone
 PREVIEW_FRESH_SECS = 2.0       # webcam frame older than this = feed lost
 GUARD_LOW_FPS = FPS * 0.8      # sustained fps below this trips the guard
@@ -70,6 +72,45 @@ class State(Enum):
     ROLLING = auto()
     HOLE_DONE = auto()
     ROUND_DONE = auto()
+
+
+@dataclass
+class ShotStat:
+    """One recorded putt, for the in-game stats automation."""
+    hole_number: int
+    putt_no: int
+    speed_mph: float
+    hla_deg: float
+    start_dist_ft: float
+    rollout_ft: float = 0.0
+    end_dist_ft: float = 0.0
+    holed: bool = False
+    lipped: bool = False
+    watered: bool = False
+    pace_hint_mph: float = 0.0     # what a good putt needed
+
+    @property
+    def pace_err_pct(self) -> float:
+        if self.pace_hint_mph <= 0:
+            return 0.0
+        return (self.speed_mph - self.pace_hint_mph) / self.pace_hint_mph * 100.0
+
+    @property
+    def verdict(self) -> str:
+        if self.holed:
+            return "HOLED"
+        if self.watered:
+            return "IN THE WATER"
+        if self.lipped:
+            return "LIPPED OUT"
+        e = self.pace_err_pct
+        if e > 22:
+            return "TOO FIRM"
+        if e < -22:
+            return "LEFT SHORT"
+        if abs(self.hla_deg) > 3.0:
+            return "PUSHED" if self.hla_deg > 0 else "PULLED"
+        return "GOOD PACE"
 
 
 @dataclass
@@ -89,6 +130,32 @@ class Round:
     course: Course
     hole_idx: int = 0
     scores: List[HoleScore] = field(default_factory=list)
+    shots: List[ShotStat] = field(default_factory=list)
+
+    def hole_shots(self, number: int) -> List[ShotStat]:
+        return [s for s in self.shots if s.hole_number == number]
+
+    @property
+    def stats(self) -> dict:
+        """Round-wide putting stats for the HUD / scorecard."""
+        done = [s for s in self.shots if s.rollout_ft > 0 or s.holed]
+        if not done:
+            return {}
+        speeds = [s.speed_mph for s in done]
+        hlas = [s.hla_deg for s in done]
+        made = [s for s in done if s.holed]
+        errs = [s.pace_err_pct for s in done if s.pace_hint_mph > 0]
+        return {
+            "putts": len(done),
+            "made": len(made),
+            "avg_mph": sum(speeds) / len(speeds),
+            "fast_mph": max(speeds),
+            "avg_hla": sum(hlas) / len(hlas),
+            "avg_abs_hla": sum(abs(h) for h in hlas) / len(hlas),
+            "avg_pace_err": (sum(errs) / len(errs)) if errs else 0.0,
+            "longest_ft": max(s.rollout_ft for s in done),
+            "make_pct": 100.0 * len(made) / len(done),
+        }
 
     @property
     def hole(self) -> Hole:
@@ -127,6 +194,14 @@ class Game:
         self.shake = 0.0
         self._sink_start: Optional[float] = None
         self._in_sand = False
+
+        # auto-advance + shot stats automation
+        self.advance_secs = DEFAULT_ADVANCE_SECS
+        self._hole_done_at: Optional[float] = None
+        self._shot: Optional[ShotStat] = None      # putt currently rolling
+        self.last_stat: Optional[ShotStat] = None  # most recent completed
+        self._stat_shown_at: Optional[float] = None
+        self.show_stats_card = True
 
         # display / performance
         self.preset_idx = 0
@@ -206,6 +281,13 @@ class Game:
                 self.aim_trim_deg = 0.0
             self.show_read = bool(data.get("show_read", False))
             self.sound_on = bool(data.get("sound_on", True))
+            self.show_stats_card = bool(data.get("show_stats_card", True))
+            try:
+                adv = float(data.get("advance_secs", DEFAULT_ADVANCE_SECS))
+                self.advance_secs = min(HOLE_ADVANCE_CHOICES,
+                                        key=lambda v: abs(v - adv))
+            except (TypeError, ValueError):
+                self.advance_secs = DEFAULT_ADVANCE_SECS
         except (OSError, ValueError, TypeError):
             pass
 
@@ -220,7 +302,9 @@ class Game:
                            "mercy_limit": self.mercy_limit,
                            "aim_trim_deg": self.aim_trim_deg,
                            "show_read": self.show_read,
-                           "sound_on": self.sound_on}, fh)
+                           "sound_on": self.sound_on,
+                           "advance_secs": self.advance_secs,
+                           "show_stats_card": self.show_stats_card}, fh)
         except OSError:
             pass
 
@@ -294,6 +378,9 @@ class Game:
         self.last_shot_info = ""
         self._preview_key = None
         self._pre_shot = None       # fresh hole = nothing to undo
+        self._hole_done_at = None
+        self._sink_start = None
+        self._shot = None
         self.set_banner(f"Hole {h.number} — {h.name}")
 
     def set_banner(self, msg: str, secs: float = 2.5) -> None:
@@ -318,6 +405,17 @@ class Game:
         applied_hla = hla_deg
         if not self.test_mode and self.aim_trim_deg:
             applied_hla = hla_deg + self.aim_trim_deg
+        # start recording this putt's stats
+        h = self.round.hole
+        start_ft = math.hypot(self.ball.x - self.physics.hole_pos[0],
+                              self.ball.y - self.physics.hole_pos[1]) / FT_TO_M
+        self._shot = ShotStat(
+            hole_number=h.number, putt_no=score.putts,
+            speed_mph=speed_mph, hla_deg=hla_deg,
+            start_dist_ft=start_ft,
+            pace_hint_mph=suggest_speed_mph(start_ft, h.slope_pct,
+                                            self.current_stimp()))
+        self._shot_start_pos = (self.ball.x, self.ball.y)
         self.physics.launch(self.ball, speed_mph, applied_hla)
         self._snd("putt", min(1.0, 0.4 + speed_mph / 8.0))
         self.trail = [self.ball.pos]
@@ -359,6 +457,25 @@ class Game:
         self.set_banner(f"Mulligan — putt {score.putts + 1} again", 2.0)
         return True
 
+    def _record_shot(self, holed: bool = False, watered: bool = False) -> None:
+        """Close out the rolling putt's stat line and file it on the round."""
+        if self._shot is None:
+            return
+        s = self._shot
+        self._shot = None
+        sx, sy = getattr(self, "_shot_start_pos", (0.0, 0.0))
+        s.rollout_ft = math.hypot(self.ball.x - sx,
+                                  self.ball.y - sy) / FT_TO_M
+        s.end_dist_ft = math.hypot(
+            self.ball.x - self.physics.hole_pos[0],
+            self.ball.y - self.physics.hole_pos[1]) / FT_TO_M
+        s.holed = holed
+        s.watered = watered
+        s.lipped = self.lipped
+        self.round.shots.append(s)
+        self.last_stat = s
+        self._stat_shown_at = self.time
+
     def finish_hole(self, holed: bool) -> None:
         score = self.round.scores[self.round.hole_idx]
         if not holed:
@@ -370,6 +487,7 @@ class Game:
             label = f"Picked up after {self.mercy_limit} putts."
         self.set_banner(label, 3.0)
         self.state = State.HOLE_DONE
+        self._hole_done_at = self.time      # arms the auto-advance timer
 
     def next_hole(self) -> None:
         if self.round.hole_idx + 1 < len(self.round.course.holes):
@@ -386,6 +504,15 @@ class Game:
         if self.shake > 0:
             self.shake = max(0.0, self.shake - dt * 1.4)
         self._update_guard(dt)
+
+        # auto-advance: no ENTER needed once the hole is done. The timer is
+        # paused while any overlay is open so it can't skip out from under you.
+        if (self.state == State.HOLE_DONE and self.advance_secs > 0
+                and self._hole_done_at is not None
+                and not (self.settings_open or self.show_help)):
+            if self.time - self._hole_done_at >= self.advance_secs:
+                self._hole_done_at = None
+                self.next_hole()
 
         shot = ShotListener.get_shot()
         if shot:
@@ -444,12 +571,14 @@ class Game:
                             else (0.0, 0.0))
                     self.ball.x, self.ball.y = back
                     self.ball.vx = self.ball.vy = 0.0
+                    self._record_shot(watered=True)
                     self.state = State.AWAIT_PUTT
                     self.scene.position_camera(self.ball.pos)
                     self._preview_key = None
                     self.set_banner("Splash! Replay from the last spot", 2.5)
                     break
                 elif result == "holed":
+                    self._record_shot(holed=True)
                     self._snd("sink")
                     self._sink_start = self.time
                     if self.scene:
@@ -458,6 +587,7 @@ class Game:
                     self.finish_hole(holed=True)
                     break
                 elif result == "stopped":
+                    self._record_shot()
                     score = self.round.scores[self.round.hole_idx]
                     if score.putts >= self.mercy_limit:
                         self.finish_hole(holed=False)
@@ -630,6 +760,13 @@ class Game:
                      f"LEFT/RIGHT ±{STIMP_STEP} — bigger = faster green"))
         rows.append(("Mercy Limit", f"{self.mercy_limit} putts", "int",
                      "auto pick-up after this many strokes"))
+        rows.append(("Auto-Advance Hole",
+                     "OFF (press ENTER)" if self.advance_secs <= 0
+                     else f"{self.advance_secs:.0f} s", "choice",
+                     "load the next hole automatically after a delay"))
+        rows.append(("Shot Stats Card",
+                     "ON" if self.show_stats_card else "OFF", "toggle",
+                     "auto pop-up with speed/HLA/rollout after each putt"))
         rows.append(("Aim Trim (camera mode)",
                      f"{self.aim_trim_deg:+.1f}°", "float",
                      "LEFT/RIGHT bias for real putts (narrow-mat helper)"))
@@ -709,6 +846,17 @@ class Game:
                 self.mercy_limit = max(MIN_MERCY_LIMIT,
                                        min(MAX_MERCY_LIMIT,
                                            self.mercy_limit + delta))
+                self._save_settings()
+        elif label.startswith("Auto-Advance"):
+            if delta:
+                i = HOLE_ADVANCE_CHOICES.index(self.advance_secs) \
+                    if self.advance_secs in HOLE_ADVANCE_CHOICES else 2
+                i = max(0, min(len(HOLE_ADVANCE_CHOICES) - 1, i + delta))
+                self.advance_secs = HOLE_ADVANCE_CHOICES[i]
+                self._save_settings()
+        elif label.startswith("Shot Stats Card"):
+            if enter or delta:
+                self.show_stats_card = not self.show_stats_card
                 self._save_settings()
         elif label.startswith("Aim Trim"):
             if delta:
@@ -1067,6 +1215,16 @@ class Game:
         self.scene.draw(c, ball_pos, trail=self.trail[::3], t=self.time,
                         aim=aim, preview=preview, ball_scale=ball_scale)
 
+        # animated ball-setup reticle on the green (camera mode only): shows
+        # searching / locking / ready right where the ball sits
+        if self.state == State.AWAIT_PUTT and not self.test_mode:
+            _msg, _col, lock, ready = self.tracker_badge()
+            age, st = ShotListener.get_tracker_status()
+            fresh = age is not None and age <= TRACKER_FRESH_SECS
+            detected = fresh and bool(st.get("balldetected") or st.get("locking"))
+            self.scene.draw_setup_reticle(c, self.ball.pos, self.time,
+                                          lock, ready, detected)
+
         # minimap (hidden when the camera panel occupies that corner)
         if self.show_minimap and not (self.debug or self.camera_monitor):
             mm = pygame.Rect(W - gfx.sc(106), gfx.sc(8),
@@ -1105,6 +1263,15 @@ class Game:
         if self.state == State.AWAIT_PUTT and not self.test_mode:
             self.draw_ready_badge()
 
+        # automatic shot-stats card after every putt
+        if self.show_stats_card and self.last_stat is not None:
+            self.draw_shot_stats()
+
+        # auto-advance countdown ring
+        if (self.state == State.HOLE_DONE and self.advance_secs > 0
+                and self._hole_done_at is not None):
+            self.draw_advance_ring()
+
         # bottom status bar
         bar = pygame.Rect(gfx.sc(6), H - gfx.sc(30), W - gfx.sc(12), gfx.sc(24))
         gfx.panel(c, bar, alpha=200)
@@ -1114,7 +1281,13 @@ class Game:
                         "SPACE putt", bar.x + gfx.sc(10), bar.y + gfx.sc(5),
                      gfx.ACCENT, 15)
         elif self.state == State.HOLE_DONE:
-            gfx.text(c, "ENTER for next hole", bar.x + gfx.sc(10),
+            if self.advance_secs > 0 and self._hole_done_at is not None:
+                left = max(0.0, self.advance_secs
+                           - (self.time - self._hole_done_at))
+                msg = f"next hole in {left:.0f}s   (ENTER to skip)"
+            else:
+                msg = "ENTER for next hole"
+            gfx.text(c, msg, bar.x + gfx.sc(10),
                      bar.y + gfx.sc(5), gfx.HUD_TEXT, 15)
         elif self.state == State.ROLLING:
             mph = self.ball.speed / 0.44704
@@ -1169,6 +1342,78 @@ class Game:
             barr = pygame.Rect(rect.x + gfx.sc(12), rect.bottom - gfx.sc(8),
                                rect.w - gfx.sc(24), gfx.sc(4))
             gfx.progress_bar(c, barr, frac, col)
+
+    # ------------------------------------------------- shot stats card
+    def draw_shot_stats(self) -> None:
+        """Slide-in card summarizing the putt that just finished, plus a
+        running round line. Appears automatically, fades itself out."""
+        s = self.last_stat
+        if s is None or self._stat_shown_at is None:
+            return
+        age = self.time - self._stat_shown_at
+        hold = 4.5 if self.state == State.HOLE_DONE else 3.2
+        if age > hold:
+            return
+        c = self.canvas
+        W, H = gfx.INTERNAL_W, gfx.INTERNAL_H
+        pw, ph = gfx.sc(186), gfx.sc(112)
+        # slide in from the left, then slide out at the end
+        slide = min(1.0, age / 0.28)
+        if age > hold - 0.35:
+            slide = max(0.0, (hold - age) / 0.35)
+        x = int(-pw + (gfx.sc(6) + pw) * (slide ** 0.6))
+        rect = pygame.Rect(x, H - gfx.sc(30) - ph - gfx.sc(10), pw, ph)
+        gfx.panel(c, rect, alpha=222)
+        col = (gfx.GOOD if s.holed else
+               gfx.BAD if s.watered else
+               gfx.WARN if s.lipped else gfx.ACCENT)
+        pygame.draw.rect(c, col, rect, 1, border_radius=gfx.sc(5))
+        gfx.text(c, s.verdict, rect.x + gfx.sc(10), rect.y + gfx.sc(6),
+                 col, 17, shadow=True)
+
+        rows = [
+            ("speed", f"{s.speed_mph:.2f} mph"),
+            ("HLA", f"{s.hla_deg:+.1f}°"),
+            ("rollout", f"{s.rollout_ft:.1f} ft"),
+            ("pace", f"{s.pace_err_pct:+.0f}% of ideal"
+                     if s.pace_hint_mph > 0 else "—"),
+            ("result", "in the cup" if s.holed
+                       else f"{s.end_dist_ft:.1f} ft left"),
+        ]
+        y = rect.y + gfx.sc(26)
+        for label, value in rows:
+            gfx.text(c, label, rect.x + gfx.sc(10), y, gfx.HUD_DIM, 13)
+            vw = gfx.text_w(value, 13)
+            vcol = gfx.HUD_TEXT
+            if label == "pace" and s.pace_hint_mph > 0:
+                vcol = (gfx.GOOD if abs(s.pace_err_pct) <= 15
+                        else gfx.WARN if abs(s.pace_err_pct) <= 35
+                        else gfx.BAD)
+            gfx.text(c, value, rect.right - gfx.sc(10) - vw, y, vcol, 13)
+            y += gfx.sc(16)
+
+    def draw_advance_ring(self) -> None:
+        """Countdown arc showing when the next hole loads automatically."""
+        left = max(0.0, self.advance_secs
+                   - (self.time - self._hole_done_at))
+        frac = left / self.advance_secs if self.advance_secs else 0.0
+        c = self.canvas
+        W = gfx.INTERNAL_W
+        cx, cy = W // 2, gfx.sc(140)
+        r = gfx.sc(19)
+        pygame.draw.circle(c, (18, 28, 20), (cx, cy), r)
+        pygame.draw.circle(c, gfx.HUD_DIM, (cx, cy), r, 1)
+        if frac > 0:
+            pts = [(cx, cy)]
+            steps = max(3, int(34 * frac))
+            for i in range(steps + 1):
+                a = -math.pi / 2 + 2 * math.pi * frac * (i / steps)
+                pts.append((cx + math.cos(a) * (r - 2),
+                            cy + math.sin(a) * (r - 2)))
+            if len(pts) > 2:
+                pygame.draw.polygon(c, gfx.ACCENT, pts)
+        gfx.text(c, f"{left:.0f}", cx, cy - gfx.sc(8), gfx.HUD_BG, 18,
+                 center=True)
 
     # ------------------------------------------------- perf readout
     def draw_perf_readout(self) -> None:
@@ -1225,6 +1470,28 @@ class Game:
         if any(s.mulligans for s in r.scores):
             gfx.text(c, "\u2020 mulligan used", W // 2, gfx.sc(244),
                      gfx.HUD_DIM, 14, center=True)
+        # round putting stats, computed from every recorded shot
+        st = self.round.stats if self.round else {}
+        if st:
+            cells = [
+                ("putts", f"{st['putts']}"),
+                ("made", f"{st['made']}  ({st['make_pct']:.0f}%)"),
+                ("avg speed", f"{st['avg_mph']:.2f} mph"),
+                ("avg pace", f"{st['avg_pace_err']:+.0f}%"),
+                ("avg |HLA|", f"{st['avg_abs_hla']:.1f}°"),
+                ("longest", f"{st['longest_ft']:.1f} ft"),
+            ]
+            sw = gfx.sc(150)
+            x0 = W // 2 - sw * 3 // 2
+            sy = gfx.sc(246)
+            gfx.text(c, "PUTTING STATS", W // 2, sy - gfx.sc(18),
+                     gfx.ACCENT, 16, center=True)
+            for i, (label, value) in enumerate(cells):
+                cx = x0 + (i % 3) * sw
+                cy = sy + (i // 3) * gfx.sc(26)
+                gfx.text(c, label, cx, cy, gfx.HUD_DIM, 13)
+                gfx.text(c, value, cx + gfx.sc(74), cy, gfx.HUD_TEXT, 14)
+
         gfx.text(c, "ENTER menu    R replay course", W // 2, H - gfx.sc(34),
                  gfx.HUD_DIM, 16, center=True)
 
