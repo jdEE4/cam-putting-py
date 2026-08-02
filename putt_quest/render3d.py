@@ -27,6 +27,17 @@ Vec2 = Tuple[float, float]
 
 # visual exaggeration of the (physically small) slope grades
 Z_EXAG = 6.0
+# ramps carry REAL height; a gentler exaggeration keeps them believable
+RAMP_EXAG = 3.2
+# directional light for terrain shading (normalized-ish, +z up)
+LIGHT_DIR = (-0.35, -0.30, 0.89)
+
+# sky palettes per course theme: (sky_top, sky_horizon, sun_tint)
+THEMES = {
+    "day":    ((92, 148, 218), (196, 219, 235), (255, 246, 214)),
+    "dusk":   ((44, 42, 96), (238, 128, 92), (255, 196, 140)),
+    "alpine": ((64, 126, 205), (218, 236, 246), (255, 252, 235)),
+}
 CUP_VISUAL_R = 0.085        # a touch bigger than regulation so it reads
 BALL_VISUAL_R = 0.032
 FLAG_HEIGHT = 1.85          # a bit under regulation; reads better up close
@@ -64,6 +75,12 @@ BUMPER_TOP = (232, 78, 78)
 BUMPER_SIDE = (176, 52, 52)
 SAND_COL = (206, 186, 132)
 SAND_DARK = (178, 158, 108)
+WATER_DEEP = (18, 52, 86)
+WATER_EDGE = (96, 158, 198)
+WATER_GLINT = (196, 230, 250)
+CHUTE_TOP = (172, 178, 194)
+CHUTE_SIDE = (118, 124, 140)
+CHUTE_FLOOR = (52, 56, 68)
 BOOST_COL = (120, 210, 255)
 PORTAL_A = (120, 235, 255)
 PORTAL_B = (255, 140, 245)
@@ -132,12 +149,27 @@ class GreenScene:
     rest (it re-renders the cached background); call draw() every frame."""
 
     def __init__(self, size: Tuple[int, int], hole_dist_m: float,
-                 break_pct: float, slope_pct: float, features=None):
+                 break_pct: float, slope_pct: float, features=None,
+                 theme: str = "day"):
         self.size = size
         self.dist = hole_dist_m
         self.break_pct = break_pct
         self.slope_pct = slope_pct
         self.features = features
+        self.theme = THEMES.get(theme, THEMES["day"])
+        # particle system (world-space, +z up)
+        self.particles: List[dict] = []
+        self._last_t: Optional[float] = None
+        self._water_glints: List[Tuple[float, float, float]] = []
+        if features is not None:
+            rnd = random.Random(77)
+            for wz in features.water:
+                for _ in range(8):
+                    a = rnd.uniform(0, 2 * math.pi)
+                    rr = wz.r * math.sqrt(rnd.uniform(0.05, 0.85))
+                    self._water_glints.append(
+                        (wz.x + rr * math.cos(a), wz.y + rr * math.sin(a),
+                         rnd.uniform(0, 6.28)))
         cup_x = features.cup_x if features is not None else 0.0
         self.cup = (cup_x, hole_dist_m)
         self.cup_visual_r = CUP_VISUAL_R * (features.cup_scale
@@ -154,9 +186,13 @@ class GreenScene:
     def height(self, x: float, y: float) -> float:
         """Visually exaggerated surface height matching the physics tilt:
         +break pushes the ball right => ground falls toward +x;
-        +slope is uphill toward the cup => ground rises with +y."""
-        return Z_EXAG * ((self.slope_pct / 100.0) * y
-                         - (self.break_pct / 100.0) * x)
+        +slope is uphill toward the cup => ground rises with +y.
+        Ramps add real (mildly exaggerated) elevation on top."""
+        h = Z_EXAG * ((self.slope_pct / 100.0) * y
+                      - (self.break_pct / 100.0) * x)
+        if self.features is not None and self.features.ramps:
+            h += RAMP_EXAG * self.features.height_at(x, y)
+        return h
 
     def surface_pt(self, x: float, y: float, lift: float = 0.0):
         return (x, y, self.height(x, y) + lift)
@@ -214,16 +250,17 @@ class GreenScene:
 
     def _draw_sky(self, bg: pygame.Surface) -> None:
         w, h = self.size
+        sky_top, sky_horizon, sun_tint = self.theme
         hy = _clamp(self._horizon_y(), h // 6, h - 20)
         for y in range(0, hy + 1):
             t = y / max(1, hy)
             col = tuple(int(a + (b - a) * t)
-                        for a, b in zip(SKY_TOP, SKY_HORIZON))
+                        for a, b in zip(sky_top, sky_horizon))
             pygame.draw.line(bg, col, (0, y), (w, y))
         # soft sun
         sun = pygame.Surface((120, 120), pygame.SRCALPHA)
         for r, a in ((56, 26), (40, 40), (22, 110)):
-            pygame.draw.circle(sun, (*SUN, a), (60, 60), r)
+            pygame.draw.circle(sun, (*sun_tint, a), (60, 60), r)
         bg.blit(sun, (int(w * 0.72) - 60, int(hy * 0.32) - 60))
         # clouds
         rnd = random.Random(9)
@@ -270,6 +307,8 @@ class GreenScene:
                 return GREEN_A if int(my // stripe_w) % 2 == 0 else GREEN_B
             return FRINGE if zone == "fringe" else ROUGH
 
+        lx, ly, lz = LIGHT_DIR
+
         def draw_quad(xa, xb, ya, yb, noise):
             quad = []
             depth_sum = 0.0
@@ -284,11 +323,34 @@ class GreenScene:
                     or max(q[1] for q in quad) < -4
                     or min(q[1] for q in quad) > self.size[1] + 4):
                 return
-            col = base_color((xa + xb) / 2, (ya + yb) / 2)
+            mx, my = (xa + xb) / 2, (ya + yb) / 2
+            col = base_color(mx, my)
+            # diffuse directional lighting from the surface normal (this is
+            # what makes slopes and ramps read as real 3D shapes)
+            dhx = (self.height(xb, my) - self.height(xa, my)) / (xb - xa)
+            dhy = (self.height(mx, yb) - self.height(mx, ya)) / (yb - ya)
+            inv = 1.0 / math.sqrt(dhx * dhx + dhy * dhy + 1.0)
+            ndl = (-dhx * lx - dhy * ly + lz) * inv
+            light = _clamp((ndl - lz) * 2.6, -0.6, 0.5)
             # cheap texture + aerial haze with distance
             fog = min(0.32, 0.40 * (depth_sum / 4) / fog_far)
-            col = _shade(_shade(col, noise), fog, HAZE)
+            col = _shade(_shade(_shade(col, noise), light), fog, HAZE)
             pygame.draw.polygon(bg, col, quad)
+
+        ramps = self.features.ramps if self.features is not None else ()
+
+        def cell_needs_split(xa, xb, ya, yb) -> bool:
+            zones = {self._green_zone(x, y)
+                     for x in (xa, xb, (xa + xb) / 2)
+                     for y in (ya, yb, (ya + yb) / 2)}
+            if len(zones) > 1:
+                return True
+            if ramps:
+                hs = [self.height(x, y) for x in (xa, xb)
+                      for y in (ya, yb)]
+                if max(hs) - min(hs) > 0.05:      # ramp edge / slope face
+                    return True
+            return False
 
         # painter's algorithm: far rows first (camera looks toward +y)
         for iy in range(rows - 1, -1, -1):
@@ -297,14 +359,11 @@ class GreenScene:
                 xa, xb = -half_w + ix * dxs, -half_w + (ix + 1) * dxs
                 n = (((ix * 928371 + iy * 123457)
                       ^ (ix * iy * 26543 + 977)) % 13 - 6) * 0.004
-                zones = {self._green_zone(x, y)
-                         for x in (xa, xb, (xa + xb) / 2)
-                         for y in (ya, yb, (ya + yb) / 2)}
-                if len(zones) == 1:
+                if not cell_needs_split(xa, xb, ya, yb):
                     draw_quad(xa, xb, ya, yb, n)
                 else:
-                    # zone boundary crosses this cell: subdivide 3x3 so
-                    # the green's curved edge stays smooth
+                    # boundary or elevation change: subdivide 3x3 so curved
+                    # edges and ramp faces stay smooth
                     for sy in range(3):
                         for sx in range(3):
                             draw_quad(xa + sx * dxs / 3,
@@ -325,10 +384,51 @@ class GreenScene:
             pts.append((p[0], p[1]))
         return pts
 
+    @staticmethod
+    def _chute_offsets(points, half=0.10):
+        """Left/right offset polylines for a chute channel."""
+        left, right = [], []
+        n = len(points)
+        for i, (x, y) in enumerate(points):
+            a = points[max(0, i - 1)]
+            b = points[min(n - 1, i + 1)]
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            L = math.hypot(dx, dy) or 1e-9
+            px, py = -dy / L * half, dx / L * half
+            left.append((x + px, y + py))
+            right.append((x - px, y - py))
+        return left, right
+
     def _draw_flat_features(self, bg: pygame.Surface) -> None:
         f = self.features
         if f is None:
             return
+        for wz in f.water:
+            ring = self._proj_ring(wz.x, wz.y, wz.r, 0.004)
+            inner = self._proj_ring(wz.x, wz.y, wz.r * 0.72, 0.004)
+            if ring:
+                pygame.draw.polygon(bg, WATER_EDGE, ring)
+            if inner:
+                pygame.draw.polygon(bg, WATER_DEEP, inner)
+            if ring:
+                pygame.draw.aalines(bg, WATER_EDGE, True, ring)
+        for ch in f.chutes:
+            left, right = self._chute_offsets(ch.points)
+            for i in range(len(ch.points) - 1):
+                quad = []
+                for (x, y) in (left[i], left[i + 1],
+                               right[i + 1], right[i]):
+                    p = self.cam.project(self.surface_pt(x, y, 0.008))
+                    if p is None:
+                        quad = []
+                        break
+                    quad.append((p[0], p[1]))
+                if quad:
+                    pygame.draw.polygon(bg, CHUTE_FLOOR, quad)
+            mouth = self._proj_ring(ch.points[0][0], ch.points[0][1],
+                                    ch.r, 0.01)
+            if mouth:
+                pygame.draw.aalines(bg, CHUTE_TOP, True, mouth)
         for s in f.sand:
             ring = self._proj_ring(s.x, s.y, s.r, 0.006)
             if ring:
@@ -404,6 +504,16 @@ class GreenScene:
         for m in f.windmills:
             # static hub post lives in the background; blades are dynamic
             solids.append((math.hypot(m.x - ex, m.y - ey), "hub", m))
+        for ch in f.chutes:
+            left, right = self._chute_offsets(ch.points)
+            for side in (left, right):
+                for i in range(len(side) - 1):
+                    mx = (side[i][0] + side[i + 1][0]) / 2
+                    my = (side[i][1] + side[i + 1][1]) / 2
+                    seg = (side[i][0], side[i][1],
+                           side[i + 1][0], side[i + 1][1])
+                    solids.append((math.hypot(mx - ex, my - ey),
+                                   "chute", seg))
         for _, kind, ob in sorted(solids, key=lambda s: -s[0]):
             if kind == "wall":
                 prism = self._wall_prism(ob.x1, ob.y1, ob.x2, ob.y2, ob.h)
@@ -417,6 +527,17 @@ class GreenScene:
                         [base[i], base[j], top[j], top[i]])
                 pygame.draw.polygon(bg, RAIL_TOP, top)
                 pygame.draw.aalines(bg, RAIL_DARK, True, top)
+            elif kind == "chute":
+                x1, y1, x2, y2 = ob
+                prism = self._wall_prism(x1, y1, x2, y2, 0.09, half_t=0.018)
+                if prism is None:
+                    continue
+                base, top = prism
+                for i in range(4):
+                    j = (i + 1) % 4
+                    pygame.draw.polygon(bg, CHUTE_SIDE,
+                                        [base[i], base[j], top[j], top[i]])
+                pygame.draw.polygon(bg, CHUTE_TOP, top)
             elif kind == "bumper":
                 lo = self._proj_ring(ob.x, ob.y, ob.r, 0.0, 14)
                 hi = self._proj_ring(ob.x, ob.y, ob.r, 0.10, 14)
@@ -462,6 +583,76 @@ class GreenScene:
                 if tip:
                     pygame.draw.circle(canvas, MILL_EDGE,
                                        (int(tip[0]), int(tip[1])), 3)
+
+    # ------------------------------------------------------- particles
+    PARTICLE_KINDS = {
+        # kind: (count, colors, speed_xy, vz_range, life, gravity)
+        "confetti": (26, ((255, 214, 90), (120, 220, 120), (140, 235, 255),
+                          (255, 140, 245)), 1.2, (1.4, 3.2), 1.0, -4.5),
+        "spark":    (12, ((255, 240, 160), (255, 200, 90)),
+                     1.8, (0.4, 1.6), 0.35, -6.0),
+        "splash":   (18, ((196, 230, 250), (96, 158, 198), (240, 248, 255)),
+                     0.9, (1.2, 2.6), 0.55, -7.0),
+        "poof":     (9, ((206, 186, 132), (178, 158, 108)),
+                     0.5, (0.3, 0.9), 0.45, -1.6),
+        "shimmer":  (14, ((120, 235, 255), (255, 140, 245)),
+                     0.5, (0.5, 1.4), 0.65, -0.8),
+    }
+
+    def spawn_particles(self, kind: str, x: float, y: float) -> None:
+        spec = self.PARTICLE_KINDS.get(kind)
+        if spec is None:
+            return
+        count, colors, sxy, vzr, life, grav = spec
+        rnd = random
+        base_z = self.height(x, y)
+        for _ in range(count):
+            a = rnd.uniform(0, 2 * math.pi)
+            sp = rnd.uniform(0.15, sxy)
+            self.particles.append({
+                "x": x, "y": y, "z": base_z + 0.03,
+                "vx": math.cos(a) * sp, "vy": math.sin(a) * sp,
+                "vz": rnd.uniform(*vzr), "g": grav,
+                "life": life * rnd.uniform(0.7, 1.15), "age": 0.0,
+                "col": colors[rnd.randrange(len(colors))],
+            })
+
+    def _update_draw_particles(self, canvas: pygame.Surface,
+                               t: float) -> None:
+        dt = 0.0 if self._last_t is None else _clamp(t - self._last_t,
+                                                     0.0, 0.05)
+        self._last_t = t
+        alive = []
+        for p in self.particles:
+            p["age"] += dt
+            if p["age"] >= p["life"]:
+                continue
+            p["vz"] += p["g"] * dt
+            p["x"] += p["vx"] * dt
+            p["y"] += p["vy"] * dt
+            p["z"] += p["vz"] * dt
+            floor = self.height(p["x"], p["y"])
+            if p["z"] < floor:
+                p["z"] = floor
+                p["vz"] *= -0.35
+            proj = self.cam.project((p["x"], p["y"], p["z"]))
+            if proj is not None:
+                r = max(1, int(self.cam.scale_at(proj[2]) * 0.014))
+                pygame.draw.circle(canvas, p["col"],
+                                   (int(proj[0]), int(proj[1])), r)
+            alive.append(p)
+        self.particles = alive
+
+    def _draw_water_glints(self, canvas: pygame.Surface, t: float) -> None:
+        for (gx, gy, phase) in self._water_glints:
+            tw = 0.5 + 0.5 * math.sin(t * 2.4 + phase)
+            if tw < 0.45:
+                continue
+            p = self.cam.project(self.surface_pt(gx, gy, 0.006))
+            if p is not None:
+                r = max(1, int(self.cam.scale_at(p[2]) * 0.010 * tw))
+                pygame.draw.circle(canvas, WATER_GLINT,
+                                   (int(p[0]), int(p[1])), r)
 
     def _draw_portal_glow(self, canvas: pygame.Surface, t: float) -> None:
         f = self.features
@@ -521,12 +712,15 @@ class GreenScene:
     def draw(self, canvas: pygame.Surface, ball_pos: Optional[Vec2],
              trail: Sequence[Vec2] = (), t: float = 0.0,
              aim: Optional[Tuple[Vec2, float]] = None,
-             preview: Sequence[Vec2] = ()) -> None:
+             preview: Sequence[Vec2] = (),
+             ball_scale: float = 1.0) -> None:
         """aim: (from_pos, hla_deg) draws the dashed aim line.
-        preview: optional simulated path (test mode ghost)."""
+        preview: optional simulated path (test mode ghost).
+        ball_scale: shrink factor for the cup-sink animation."""
         if self.bg is None:
             self.position_camera(ball_pos or (0.0, 0.0))
         canvas.blit(self.bg, (0, 0))
+        self._draw_water_glints(canvas, t)
         if aim is not None:
             self._draw_aim(canvas, aim[0], aim[1])
         if preview:
@@ -536,8 +730,9 @@ class GreenScene:
         self._draw_portal_glow(canvas, t)
         self._draw_windmills(canvas, t)
         self._draw_flag(canvas, t)
-        if ball_pos is not None:
-            self._draw_ball(canvas, ball_pos)
+        if ball_pos is not None and ball_scale > 0.02:
+            self._draw_ball(canvas, ball_pos, ball_scale)
+        self._update_draw_particles(canvas, t)
 
     def _draw_path(self, canvas, path: Sequence[Vec2], color,
                    dashed: bool = False) -> None:
@@ -601,12 +796,13 @@ class GreenScene:
         pygame.draw.circle(canvas, CUP_RIM,
                            (int(top[0]), int(top[1])), max(1, w))
 
-    def _draw_ball(self, canvas, pos: Vec2) -> None:
+    def _draw_ball(self, canvas, pos: Vec2, scale: float = 1.0) -> None:
         x, y = pos
-        p = self.cam.project(self.surface_pt(x, y, BALL_VISUAL_R))
+        p = self.cam.project(self.surface_pt(x, y, BALL_VISUAL_R * scale))
         if p is None:
             return
-        r = max(3, int(self.cam.scale_at(p[2]) * BALL_VISUAL_R))
+        r = max(1 if scale < 1.0 else 3,
+                int(self.cam.scale_at(p[2]) * BALL_VISUAL_R * scale))
         sh = self.cam.project(self.surface_pt(x, y, 0.004))
         if sh:
             shadow = pygame.Surface((r * 3, r * 2), pygame.SRCALPHA)
@@ -656,6 +852,22 @@ class GreenScene:
                                  (rect.w / 2 + hw * s, py))
         # mini golf features on the minimap
         if self.features is not None:
+            for rp in self.features.ramps:
+                x0, y0 = to_px(rp.x0, rp.y1)
+                x1, y1 = to_px(rp.x1, rp.y0)
+                zone = pygame.Surface((max(1, x1 - x0), max(1, y1 - y0)),
+                                      pygame.SRCALPHA)
+                zone.fill((255, 255, 255, 40))
+                panel.blit(zone, (x0, y0))
+            for wz in self.features.water:
+                pygame.draw.circle(panel, WATER_DEEP, to_px(wz.x, wz.y),
+                                   max(2, int(wz.r * s)))
+                pygame.draw.circle(panel, WATER_EDGE, to_px(wz.x, wz.y),
+                                   max(2, int(wz.r * s)), 1)
+            for ch in self.features.chutes:
+                pts = [to_px(x, y) for (x, y) in ch.points]
+                if len(pts) > 1:
+                    pygame.draw.lines(panel, CHUTE_TOP, False, pts, 2)
             for sz in self.features.sand:
                 pygame.draw.circle(panel, SAND_COL, to_px(sz.x, sz.y),
                                    max(2, int(sz.r * s)))

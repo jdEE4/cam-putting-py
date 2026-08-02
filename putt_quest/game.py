@@ -41,6 +41,9 @@ from .courses import COURSES, Course, Hole
 from .physics import (FT_TO_M, Ball, GreenPhysics, suggest_speed_mph)
 from .render3d import GreenScene
 from .shot_listener import ShotListener
+from .sounds import SFX
+
+import random as _random
 
 FPS = 60
 PHYS_SUBSTEPS = 4
@@ -117,6 +120,13 @@ class Game:
         self.lipped = False
         self.time = 0.0
         self.shots_received = 0
+
+        # juice: sounds, screen shake, sink animation, sand-transition edge
+        self.sfx = SFX()
+        self.sound_on = True
+        self.shake = 0.0
+        self._sink_start: Optional[float] = None
+        self._in_sand = False
 
         # display / performance
         self.preset_idx = 0
@@ -195,6 +205,7 @@ class Game:
             except (TypeError, ValueError):
                 self.aim_trim_deg = 0.0
             self.show_read = bool(data.get("show_read", False))
+            self.sound_on = bool(data.get("sound_on", True))
         except (OSError, ValueError, TypeError):
             pass
 
@@ -208,9 +219,14 @@ class Game:
                            "stimp_override": self.stimp_override,
                            "mercy_limit": self.mercy_limit,
                            "aim_trim_deg": self.aim_trim_deg,
-                           "show_read": self.show_read}, fh)
+                           "show_read": self.show_read,
+                           "sound_on": self.sound_on}, fh)
         except OSError:
             pass
+
+    def _snd(self, name: str, volume: float = 1.0) -> None:
+        if self.sound_on:
+            self.sfx.play(name, volume)
 
     # ---------------------------------------------------- tunables
     def current_stimp(self) -> float:
@@ -244,7 +260,8 @@ class Game:
             hole = self.round.hole
             self.scene = GreenScene((w, h), hole.distance_ft * FT_TO_M,
                                     hole.break_pct, hole.slope_pct,
-                                    features=hole.features)
+                                    features=hole.features,
+                                    theme=self.round.course.theme)
             self.scene.position_camera(self.ball.pos)
         self._guard_cooldown = 2.0
         self._low_fps_time = 0.0
@@ -270,7 +287,8 @@ class Game:
         self.scene = GreenScene((gfx.INTERNAL_W, gfx.INTERNAL_H),
                                 h.distance_ft * FT_TO_M,
                                 h.break_pct, h.slope_pct,
-                                features=h.features)
+                                features=h.features,
+                                theme=self.round.course.theme)
         self.scene.position_camera(self.ball.pos)
         self.state = State.AWAIT_PUTT
         self.last_shot_info = ""
@@ -301,8 +319,10 @@ class Game:
         if not self.test_mode and self.aim_trim_deg:
             applied_hla = hla_deg + self.aim_trim_deg
         self.physics.launch(self.ball, speed_mph, applied_hla)
+        self._snd("putt", min(1.0, 0.4 + speed_mph / 8.0))
         self.trail = [self.ball.pos]
         self.lipped = False
+        self._in_sand = False
         if applied_hla != hla_deg:
             self.last_shot_info = (f"{speed_mph:.1f} mph  HLA {hla_deg:+.1f}"
                                    f"° + trim {self.aim_trim_deg:+.1f}°")
@@ -355,6 +375,7 @@ class Game:
         if self.round.hole_idx + 1 < len(self.round.course.holes):
             self.load_hole(self.round.hole_idx + 1)
         else:
+            self._snd("fanfare")
             self.state = State.ROUND_DONE
 
     # ----------------------------------------------------------------
@@ -362,6 +383,8 @@ class Game:
         self.time += dt
         if self.banner_time > 0:
             self.banner_time -= dt
+        if self.shake > 0:
+            self.shake = max(0.0, self.shake - dt * 1.4)
         self._update_guard(dt)
 
         shot = ShotListener.get_shot()
@@ -377,14 +400,61 @@ class Game:
                 result = self.physics.step(self.ball, dt / PHYS_SUBSTEPS,
                                            self.time)
                 self.trail.append(self.ball.pos)
+                # sand entry (rising edge only): soft thud + dust
+                if self.scene and self.physics.features is not None:
+                    sandy = self.physics._friction_mult(
+                        self.ball.x, self.ball.y) > 1.0
+                    if sandy and not self._in_sand:
+                        self._snd("sand")
+                        self.scene.spawn_particles("poof", *self.ball.pos)
+                    self._in_sand = sandy
                 if result == "lipout":
                     self.lipped = True
+                    self._snd("lip")
                     self.set_banner("Lip out!", 1.5)
+                elif result == "bounce":
+                    self._snd("wall", min(1.0, 0.3 + self.ball.speed / 3.0))
+                    self.shake = max(self.shake, 0.08)
+                elif result == "bumper":
+                    self._snd("bumper")
+                    self.shake = max(self.shake, 0.14)
+                    if self.scene:
+                        self.scene.spawn_particles("spark", *self.ball.pos)
                 elif result == "portal":
+                    self._snd("portal")
+                    if self.scene:
+                        self.scene.spawn_particles("shimmer", *self.ball.pos)
                     self.set_banner("Warped!", 1.2)
+                elif result == "chute_enter":
+                    self._snd("chute")
+                    self.set_banner("Down the chute!", 1.2)
                 elif result == "windmill":
+                    self._snd("windmill")
+                    self.shake = max(self.shake, 0.26)
+                    if self.scene:
+                        self.scene.spawn_particles("spark", *self.ball.pos)
                     self.set_banner("Clang! Off the windmill", 1.2)
+                elif result == "water":
+                    self._snd("splash")
+                    if self.scene:
+                        self.scene.spawn_particles("splash", *self.ball.pos)
+                    # fished out: replay from where this putt started
+                    # (the stroke already counts, like real mini golf)
+                    back = (self._pre_shot["pos"] if self._pre_shot
+                            else (0.0, 0.0))
+                    self.ball.x, self.ball.y = back
+                    self.ball.vx = self.ball.vy = 0.0
+                    self.state = State.AWAIT_PUTT
+                    self.scene.position_camera(self.ball.pos)
+                    self._preview_key = None
+                    self.set_banner("Splash! Replay from the last spot", 2.5)
+                    break
                 elif result == "holed":
+                    self._snd("sink")
+                    self._sink_start = self.time
+                    if self.scene:
+                        self.scene.spawn_particles(
+                            "confetti", *self.physics.hole_pos)
                     self.finish_hole(holed=True)
                     break
                 elif result == "stopped":
@@ -566,6 +636,11 @@ class Game:
         rows.append(("Show Read Line",
                      "ON" if self.show_read else "OFF", "toggle",
                      "ghost curve of a well-struck putt at good pace"))
+        snd_val = ("ON" if self.sound_on else "OFF")
+        if not self.sfx.enabled:
+            snd_val = "no audio device"
+        rows.append(("Sound Effects", snd_val, "toggle",
+                     "synthesized SFX: putts, rails, windmill, splash..."))
         rows.append(("Resolution",
                      gfx.RES_PRESETS[self.preset_idx][0], "choice",
                      "internal render size (also on [ and ])"))
@@ -641,6 +716,12 @@ class Game:
         elif label.startswith("Show Read"):
             if enter or delta:
                 self.show_read = not self.show_read
+                self._save_settings()
+        elif label.startswith("Sound Effects"):
+            if enter or delta:
+                self.sound_on = not self.sound_on
+                if self.sound_on:
+                    self._snd("sink")      # audible confirmation
                 self._save_settings()
         elif label.startswith("Resolution"):
             if delta:
@@ -902,7 +983,13 @@ class Game:
         # help overlay sits above even the settings menu
         if self.show_help:
             self.draw_help_overlay()
-        gfx.blit_scaled(self.win, self.canvas)
+        if self.shake > 0.005:
+            amp = self.shake * gfx.sc(9)
+            offset = (int(_random.uniform(-amp, amp)),
+                      int(_random.uniform(-amp, amp)))
+        else:
+            offset = (0, 0)
+        gfx.blit_scaled(self.win, self.canvas, offset)
         pygame.display.flip()
 
     # ------------------------------------------------------------ menu
@@ -970,8 +1057,15 @@ class Game:
                 if self.show_read:
                     preview = self._read_preview()
         ball_pos = None if self.state == State.HOLE_DONE else self.ball.pos
+        ball_scale = 1.0
+        if (self.state == State.HOLE_DONE and self._sink_start is not None):
+            # sink animation: the ball shrinks into the cup for ~0.45s
+            frac = (self.time - self._sink_start) / 0.45
+            if frac < 1.0:
+                ball_pos = self.physics.hole_pos
+                ball_scale = max(0.05, 1.0 - frac)
         self.scene.draw(c, ball_pos, trail=self.trail[::3], t=self.time,
-                        aim=aim, preview=preview)
+                        aim=aim, preview=preview, ball_scale=ball_scale)
 
         # minimap (hidden when the camera panel occupies that corner)
         if self.show_minimap and not (self.debug or self.camera_monitor):

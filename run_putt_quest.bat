@@ -12,7 +12,7 @@ if not exist "%PYTHON_BIN%" (
     exit /b 1
 )
 
-"%PYTHON_BIN%" -c "import pygame" >nul 2>nul || (
+"%PYTHON_BIN%" -c "import pygame, numpy" >nul 2>nul || (
     echo Installing game dependencies from requirements-game.txt ...
     "%PYTHON_BIN%" -m pip install --upgrade pip
     "%PYTHON_BIN%" -m pip install -r "%ROOT_DIR%requirements-game.txt"
